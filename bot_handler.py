@@ -315,15 +315,27 @@ def handle_test_scrape(message: types.Message) -> None:
         )
 
         if res["matches"]:
+            from notifier import _format_platform_badge
+
             summary += "\n🔥 <b>Top Matching Posts:</b>\n"
+            bot.send_message(chat_id, summary, disable_web_page_preview=True)
+
             for idx, m in enumerate(res["matches"][:3], start=1):
-                grp = m.get("group_or_sub") or m.get("platform", "")
-                summary += (
-                    f"\n{idx}. <b>{_escape_html(m.get('platform', ''))} ({_escape_html(grp)})</b> "
-                    f"(matched <code>{_escape_html(m['matched_keyword'])}</code>)\n"
-                    f"📝 {_escape_html(m['title'][:140])}\n"
-                    f"🔗 {m['url']}\n"
+                badge = _format_platform_badge(m)
+                url = _escape_html(m.get("url", ""))
+                card = (
+                    f"<b>#{idx} Match</b> (keyword: <code>{_escape_html(m['matched_keyword'])}</code>)\n"
+                    f"{badge}\n\n"
+                    f"📝 <b>Title:</b> {_escape_html(m.get('title', ''))}\n"
+                    f"📄 <b>Description:</b> {_escape_html(m.get('description', '(no description)'))}\n\n"
+                    f"💬 <b>Suggested Public Comment:</b>\n"
+                    f"<pre>{_escape_html(m.get('suggested_comment', ''))}</pre>\n\n"
+                    f"✉️ <b>Suggested Direct Message (DM):</b>\n"
+                    f"<pre>{_escape_html(m.get('custom_dm', ''))}</pre>\n\n"
+                    f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
                 )
+                bot.send_message(chat_id, card[:4090], disable_web_page_preview=True)
+            return
         else:
             summary += (
                 "\nℹ️ <b>0 keyword matches found</b> among the latest posts scanned. "

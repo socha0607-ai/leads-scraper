@@ -132,22 +132,35 @@ def _format_platform_badge(post: dict) -> str:
     return f"🌐 {_escape_html(platform)}" + (f" ({_escape_html(group)})" if group else "")
 
 
+def _truncate_snippet(text: str, max_len: int = 360) -> str:
+    """Clean whitespace and truncate post description/snippet to ~360 chars."""
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return "(no description)"
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3].rstrip() + "..."
+
+
 def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str:
     """Format the Global 50/Day Outreach Prospect alert for ADMIN_CHAT_ID."""
     badge = _format_platform_badge(post)
     category = _escape_html(post.get("category", "agency_prospect"))
     score = int(q.get("intent_score", 0))
-    summary = _escape_html(q.get("summary", ""))
+    safe_title = _escape_html(post.get("title", ""))
+    safe_desc = _escape_html(_truncate_snippet(post.get("selftext") or post.get("body") or q.get("summary", "")))
+    safe_comment = _escape_html(q.get("suggested_comment") or q.get("custom_dm", ""))
     custom_dm = _escape_html(q.get("custom_dm", ""))
     url = _escape_html(post.get("url", ""))
 
     msg = (
         f"🚀 <b>GLOBAL OUTREACH PROSPECT [{today_count}/{DAILY_OUTREACH_TARGET} Today]</b>\n"
-        f"{badge} | 🎯 <b>Type:</b> {category} | ⚡ <b>Score:</b> {score}/10\n"
-        f"📝 <b>Context:</b> {summary}\n"
-        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>\n\n"
-        f"📋 <b>COPY-PASTE OUTREACH DM / REPLY:</b>\n"
-        f"<pre>{custom_dm}</pre>"
+        f"{badge} | 🎯 <b>Type:</b> {category} | ⚡ <b>Score:</b> {score}/10\n\n"
+        f"📝 <b>Title:</b> {safe_title}\n"
+        f"📄 <b>Description:</b> {safe_desc}\n\n"
+        f"💬 <b>Suggested Public Comment:</b>\n<pre>{safe_comment}</pre>\n\n"
+        f"✉️ <b>Suggested Direct Message (DM):</b>\n<pre>{custom_dm}</pre>\n\n"
+        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
     )
 
     if len(msg) > _MAX_MSG_LEN:
@@ -163,20 +176,24 @@ def _format_client_lead_message(post: dict, q: dict) -> str:
     niche_label = NICHE_LABELS.get(niche, niche)
     badge = _format_platform_badge(post)
 
-    safe_summary = _escape_html(q.get("summary", ""))
-    safe_dm = _escape_html(q.get("custom_dm", ""))
     safe_title = _escape_html(post.get("title", ""))
+    raw_desc = post.get("selftext") or post.get("body") or q.get("summary", "")
+    safe_desc = _escape_html(_truncate_snippet(raw_desc))
+    safe_comment = _escape_html(q.get("suggested_comment") or q.get("custom_dm", ""))
+    safe_dm = _escape_html(q.get("custom_dm", ""))
     url = _escape_html(post.get("url", ""))
 
     msg = (
         f"🚨 <b>New High-Intent Lead ({niche_label})</b>\n\n"
         f"{badge}\n"
         f"⚡ <b>Intent Score:</b> {score}/10  {score_bar}\n\n"
-        f"📝 <b>Title:</b> {safe_title}\n\n"
-        f"💡 <b>Summary:</b> {safe_summary}\n\n"
-        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>\n\n"
-        f"✉️ <b>Tailored Outreach DM / Reply:</b>\n"
-        f"<pre>{safe_dm}</pre>"
+        f"📝 <b>Title:</b> {safe_title}\n"
+        f"📄 <b>Description:</b> {safe_desc}\n\n"
+        f"💬 <b>Suggested Public Comment:</b>\n"
+        f"<pre>{safe_comment}</pre>\n\n"
+        f"✉️ <b>Suggested Direct Message (DM):</b>\n"
+        f"<pre>{safe_dm}</pre>\n\n"
+        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
     )
 
     if len(msg) > _MAX_MSG_LEN:
