@@ -1,17 +1,18 @@
 """
-scraper.py — Multi-Platform Global Harvester (Reddit RSS, Product Hunt Feed, Hacker News API,
-Indie Hackers Playwright + Post Hydration, and Authenticated X / Communities).
+scraper.py — Multi-Platform Global Harvester (Reddit Dual Multireddit RSS, Product Hunt Feed,
+Hacker News Algolia API, Lightweight Playwright Indie Hackers, and Auto-Skipping X).
 
 Combines five scraping engines into `scrape_all_platforms()`:
   1. `scrape_hackernews_api()`        — Fast JSON API via hn.algolia.com (last 24h, with author profile URL)
-  2. `scrape_reddit_global()`         — Reddit public RSS feeds (reddit.com/r/{sub}/new/.rss)
+  2. `scrape_reddit_global()`         — Dual multireddit RSS feeds with 2s delay & browser User-Agent
   3. `scrape_producthunt()`           — Product Hunt public feed (producthunt.com/feed)
-  4. `scrape_indiehackers(page)`      — Playwright on indiehackers.com/newest & /groups + post body/author hydration
-  5. `scrape_x_global(context, page)` — Stealth Playwright on x.com/home -> /search & /i/communities
+  4. `scrape_indiehackers(page)`      — Playwright on indiehackers.com/newest + post body/author hydration
+  5. `scrape_x_global(context, page)` — Optional cookie-authenticated X search & communities with auto-skip
 
-Global Playwright Speed Optimization:
+Global Playwright Speed & RAM Optimization:
   - Blocks `image`, `stylesheet`, `font`, and `media` requests via `page.route("**/*", ...)`.
   - Uses `wait_until="domcontentloaded"` with `timeout=15000` everywhere.
+  - Always closes page, context, and browser in `finally:` blocks to avoid Chromium zombies.
 """
 
 import hashlib
@@ -21,7 +22,6 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -37,13 +37,14 @@ from playwright.sync_api import (
 
 from config import (
     DISTRIBUTOR_QUERIES,
-    ENABLE_X_SCRAPER,
     GEMINI_API_KEY,
+    GROQ_API_KEY,
     HN_API_URL,
     INDIEHACKERS_NEWEST_URL,
     NICHES,
     PLAYWRIGHT_TIMEOUT_MS,
-    REDDIT_COMBINED_RSS_URL,
+    PRODUCTHUNT_FEED_URL,
+    REDDIT_RSS_URLS,
     USER_AGENT,
     X_AUTH_TOKEN,
     X_CT0,
@@ -53,8 +54,8 @@ from database import is_post_processed, mark_post_processed
 
 logger = logging.getLogger(__name__)
 
-REDDIT_RSS_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
-PRODUCTHUNT_FEED_URL = "https://www.producthunt.com/feed"
+REDDIT_RSS_DELAY_SECONDS = 2
+REDDIT_RSS_UA = USER_AGENT
 
 STEALTH_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -143,10 +144,21 @@ def _new_stealth_context(browser: Browser) -> BrowserContext:
     return context
 
 
-def scrape_all_platforms() -> list[dict]:
+def _should_attempt_x() -> tuple[bool, str]:
+    """Return (should_run, skip_reason) for optional X / Communities scraping."""
+    flag = os.getenv("ENABLE_X_SCRAPER", "").strip().lower()
+    if flag in ("false", "0", "no"):
+        return False, "disabled via ENABLE_X_SCRAPER"
+    auth_token, ct0 = _get_x_credentials()
+    if not auth_token or not ct0:
+        return False, "X_AUTH_TOKEN / X_CT0 not set"
+    return True, ""
+
+
+def scrape_all_platforms(active_niches: set[str] | None = None) -> list[dict]:
     """
-    Run all five platform harvesters (Hacker News, Reddit RSS, Product Hunt Feed,
-    Indie Hackers, and authenticated X / Communities) and return deduplicated leads.
+    Run all platform harvesters (Hacker News, dual Reddit multireddit RSS,
+    Product Hunt Feed, Indie Hackers, and auto-skipping X) and return candidate leads.
     """
     leads: list[dict] = []
 
@@ -157,34 +169,51 @@ def scrape_all_platforms() -> list[dict]:
         ("Product Hunt Feed", scrape_producthunt),
     ):
         try:
-            leads.extend(fn())
+            leads.extend(fn(active_niches=active_niches))
         except Exception as exc:
             logger.warning("%s scraper failed: %s", name, exc)
 
-    # 2. Browser-based harvesters (Indie Hackers main feed; X only if ENABLE_X_SCRAPER=true)
-    x_enabled = os.getenv("ENABLE_X_SCRAPER", "").strip().lower() == "true" or ENABLE_X_SCRAPER
+    # Check X availability up front so cookies-missing logs once at INFO cleanly
+    x_should_run, x_skip_reason = _should_attempt_x()
+    if not x_should_run:
+        logger.info("X scraper skipped cleanly (%s).", x_skip_reason)
+
+    # 2. Browser-based harvesters (Indie Hackers + optional X) with strict cleanup
     with sync_playwright() as pw:
         browser: Browser = _launch_browser(pw)
+        context: BrowserContext | None = None
+        page: Page | None = None
         try:
             context = _new_stealth_context(browser)
-            page: Page = _new_fast_page(context)
+            page = _new_fast_page(context)
 
             try:
-                leads.extend(scrape_indiehackers(page))
+                leads.extend(scrape_indiehackers(page, active_niches=active_niches))
             except Exception as exc:
                 logger.warning("Indie Hackers scraper failed: %s", exc)
 
-            if x_enabled:
+            if x_should_run:
                 try:
-                    leads.extend(scrape_x_global(context, page))
+                    leads.extend(scrape_x_global(context, page, active_niches=active_niches))
                 except Exception as exc:
-                    logger.warning("X / Communities scraper failed: %s", exc)
-            else:
-                logger.debug("X scraper disabled (set ENABLE_X_SCRAPER=true to enable).")
+                    logger.info("X scraper auto-skipped due to error: %s", exc)
         finally:
-            browser.close()
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
-    logger.info("Multi-platform harvest complete. %d new lead(s) queued for AI.", len(leads))
+    logger.info("Multi-platform harvest complete. %d candidate lead(s) queued.", len(leads))
     return leads
 
 
@@ -193,27 +222,12 @@ scrape_subreddits = scrape_all_platforms
 
 
 # ---------------------------------------------------------------------------
-# 1. Reddit Combined Public RSS Harvester (1 single request, no 429)
+# 1. Reddit Dual Multireddit Public RSS Harvester (2 light requests + 2s delay)
 # ---------------------------------------------------------------------------
 
-def _fetch_combined_reddit_rss() -> tuple[list[dict], int | None, str | None]:
-    """
-    Fetch all target subreddits in ONE combined RSS request
-    (`REDDIT_COMBINED_RSS_URL`), extracting each post's subreddit from
-    `<category term="...">`, title, cleaned body snippet, author, and URL.
-    """
-    headers = {
-        "User-Agent": REDDIT_RSS_UA,
-        "Accept": "application/atom+xml, application/xml, text/xml",
-    }
-    try:
-        resp = requests.get(REDDIT_COMBINED_RSS_URL, headers=headers, timeout=15)
-        status = resp.status_code
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-    except Exception as exc:
-        return [], getattr(locals().get("resp"), "status_code", None), str(exc)
-
+def _parse_reddit_rss_xml(xml_bytes: bytes) -> list[dict]:
+    """Parse Atom entries from a Reddit multireddit RSS response."""
+    root = ET.fromstring(xml_bytes)
     posts: list[dict] = []
     for entry in root.findall("atom:entry", _ATOM_NS):
         post_id = (entry.findtext("atom:id", default="", namespaces=_ATOM_NS) or "").strip()
@@ -250,8 +264,47 @@ def _fetch_combined_reddit_rss() -> tuple[list[dict], int | None, str | None]:
                     "author_url": author_url,
                 }
             )
+    return posts
 
-    return posts, status, None
+
+def _fetch_combined_reddit_rss() -> tuple[list[dict], int | None, str | None]:
+    """
+    Fetch target subreddits across two lightweight multireddit RSS URLs with a
+    2-second delay and realistic browser User-Agent, returning deduplicated posts.
+    """
+    headers = {
+        "User-Agent": REDDIT_RSS_UA,
+        "Accept": "application/atom+xml, application/xml, text/xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    all_posts: list[dict] = []
+    seen_ids: set[str] = set()
+    last_status: int | None = None
+    errors: list[str] = []
+
+    for idx, rss_url in enumerate(REDDIT_RSS_URLS):
+        if idx > 0:
+            time.sleep(REDDIT_RSS_DELAY_SECONDS)
+        resp = None
+        try:
+            resp = requests.get(rss_url, headers=headers, timeout=15)
+            last_status = resp.status_code
+            resp.raise_for_status()
+            parsed = _parse_reddit_rss_xml(resp.content)
+            for item in parsed:
+                if item["post_id"] not in seen_ids:
+                    seen_ids.add(item["post_id"])
+                    all_posts.append(item)
+        except Exception as exc:
+            err_status = getattr(resp, "status_code", None)
+            if err_status is not None:
+                last_status = err_status
+            errors.append(f"feed {idx + 1}: {exc}")
+
+    err_msg = "; ".join(errors) if (errors and not all_posts) else None
+    if errors and all_posts:
+        logger.warning("Partial Reddit RSS warning (%s); %d posts still retrieved.", "; ".join(errors), len(all_posts))
+    return all_posts, last_status, err_msg
 
 
 def _clean_reddit_rss_content(raw_html: str) -> str:
@@ -263,14 +316,14 @@ def _clean_reddit_rss_content(raw_html: str) -> str:
     return " ".join(text.split())
 
 
-def scrape_reddit_global() -> list[dict]:
-    """Scrape all target subreddits in ONE combined RSS call."""
+def scrape_reddit_global(active_niches: set[str] | None = None) -> list[dict]:
+    """Scrape target subreddits via dual multireddit RSS requests."""
     posts, status, err = _fetch_combined_reddit_rss()
     if err:
-        logger.warning("Combined Reddit RSS failed (%s): %s", status, err)
+        logger.warning("Reddit RSS failed (%s): %s", status, err)
         return []
 
-    logger.info("Combined Reddit RSS -> HTTP %s | %d posts", status, len(posts))
+    logger.info("Reddit Dual RSS -> HTTP %s | %d posts", status, len(posts))
     leads: list[dict] = []
 
     for item in posts:
@@ -281,21 +334,28 @@ def scrape_reddit_global() -> list[dict]:
         subreddit = item["subreddit"]
         combined = f"{item['title']} {item['selftext']}"
 
-        # Prefer niches that explicitly track this subreddit, otherwise match any niche
+        # Prefer niches that explicitly track this subreddit, otherwise check any niche
         preferred_niches = [
             k for k, cfg in NICHES.items()
             if any(s.lower() == subreddit.lower() for s in cfg.get("subreddits", []))
         ]
         candidate_niches = preferred_niches or list(NICHES.keys())
-        matched_niches = [
+        all_matched = [
             nk for nk in candidate_niches
             if _matches_keywords(combined, NICHES[nk].get("keywords", []))
         ]
-        if not matched_niches:
+        if not all_matched:
             mark_post_processed(post_id, "")
             continue
 
-        mark_post_processed(post_id, matched_niches[0])
+        if active_niches is not None:
+            matched_niches = [nk for nk in all_matched if nk in active_niches]
+        else:
+            matched_niches = all_matched
+
+        if not matched_niches:
+            continue
+
         for niche_key in matched_niches:
             cat = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
             logger.info(
@@ -328,7 +388,7 @@ def scrape_reddit_global() -> list[dict]:
 # 2. Hacker News Live API Harvester
 # ---------------------------------------------------------------------------
 
-def scrape_hackernews_api() -> list[dict]:
+def scrape_hackernews_api(active_niches: set[str] | None = None) -> list[dict]:
     """
     Fetch real-time stories & comments via hn.algolia.com/api/v1/search_by_date
     for the last 24h using `requests` (no browser needed), including author HN profile URL.
@@ -368,8 +428,10 @@ def scrape_hackernews_api() -> list[dict]:
         if not title:
             title = comment_text[:120]
 
-        niche, category = _classify_text_to_niche(combined_text)
+        niche, category = _classify_text_to_niche(combined_text, allowed_niches=active_niches)
         if not niche:
+            if active_niches is None or _classify_text_to_niche(combined_text)[0] is None:
+                mark_post_processed(post_id, "")
             continue
 
         tags = hit.get("_tags") or []
@@ -383,7 +445,6 @@ def scrape_hackernews_api() -> list[dict]:
         author = (hit.get("author") or "").strip()
         author_url = f"https://news.ycombinator.com/user?id={author}" if author else ""
         hn_url = f"https://news.ycombinator.com/item?id={object_id}"
-        mark_post_processed(post_id, niche)
 
         logger.info("MATCHED LEAD [Hacker News | %s | %s]: %.80s", group_or_sub, niche, title)
         leads.append(
@@ -418,13 +479,14 @@ def _fetch_producthunt_feed_items() -> tuple[list[dict], int | None, str | None]
         "User-Agent": REDDIT_RSS_UA,
         "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
     }
+    resp = None
     try:
         resp = requests.get(PRODUCTHUNT_FEED_URL, headers=headers, timeout=12)
         status = resp.status_code
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
     except Exception as exc:
-        return [], getattr(locals().get("resp"), "status_code", None), str(exc)
+        return [], getattr(resp, "status_code", None), str(exc)
 
     items: list[dict] = []
 
@@ -481,7 +543,7 @@ def _fetch_producthunt_feed_items() -> tuple[list[dict], int | None, str | None]
     return items, status, None
 
 
-def scrape_producthunt() -> list[dict]:
+def scrape_producthunt(active_niches: set[str] | None = None) -> list[dict]:
     """Harvest Product Hunt launches/descriptions via the public XML feed."""
     leads: list[dict] = []
     items, status, err = _fetch_producthunt_feed_items()
@@ -496,11 +558,12 @@ def scrape_producthunt() -> list[dict]:
             continue
 
         combined = f"{item['title']} {item['body']}"
-        niche, category = _classify_text_to_niche(combined)
+        niche, category = _classify_text_to_niche(combined, allowed_niches=active_niches)
         if not niche:
+            if active_niches is None or _classify_text_to_niche(combined)[0] is None:
+                mark_post_processed(post_id, "")
             continue
 
-        mark_post_processed(post_id, niche)
         logger.info("MATCHED LEAD [Product Hunt | %s]: %.80s", niche, item["title"])
         leads.append(
             {
@@ -525,7 +588,7 @@ def scrape_producthunt() -> list[dict]:
 # 4. Indie Hackers Harvester (Playwright + Post Body & Author Hydration)
 # ---------------------------------------------------------------------------
 
-def scrape_indiehackers(page: Page) -> list[dict]:
+def scrape_indiehackers(page: Page, active_niches: set[str] | None = None) -> list[dict]:
     """Scrape indiehackers.com/newest (main feed), hydrating full post body & author profile."""
     leads: list[dict] = []
     url, group_label = INDIEHACKERS_NEWEST_URL, "Indie Hackers"
@@ -536,19 +599,24 @@ def scrape_indiehackers(page: Page) -> list[dict]:
         return []
     logger.info("Indie Hackers (%s) -> HTTP %s | %d items", group_label, status, len(items))
 
+    hydrated = 0
     for item in items:
         post_id = "ih_" + hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:12]
         if is_post_processed(post_id):
             continue
 
         combined = f"{item['title']} {item['body']}"
-        niche, category = _classify_text_to_niche(combined)
+        niche, category = _classify_text_to_niche(combined, allowed_niches=active_niches)
         if not niche:
+            if active_niches is None or _classify_text_to_niche(combined)[0] is None:
+                mark_post_processed(post_id, "")
             continue
 
-        body, author, author_url = _hydrate_indiehackers_post(page, item["url"], item["title"])
+        body, author, author_url = ("", "", "")
+        if hydrated < 12:
+            body, author, author_url = _hydrate_indiehackers_post(page, item["url"], item["title"])
+            hydrated += 1
         final_body = body or item["body"]
-        mark_post_processed(post_id, niche)
         logger.info("MATCHED LEAD [Indie Hackers | %s]: %.80s", niche, item["title"])
         leads.append(
             {
@@ -706,20 +774,25 @@ def _warm_x_session(page: Page) -> tuple[int | None, str | None]:
         return None, str(exc)
 
 
-def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
+def scrape_x_global(
+    context: BrowserContext,
+    page: Page,
+    active_niches: set[str] | None = None,
+) -> list[dict]:
     """
     Inject X_AUTH_TOKEN / X_CT0 cookies, warm session on x.com/home, then scan
     live X search queries and joined X Communities (`x.com/i/communities`).
+    Auto-skips cleanly with a single info log if cookies are missing or blocked.
     """
     auth_token, ct0 = _get_x_credentials()
     if not auth_token or not ct0:
-        logger.info("X_AUTH_TOKEN / X_CT0 not set — skipping X & Communities scraper.")
+        logger.info("X scraper skipped cleanly: X_AUTH_TOKEN / X_CT0 not set.")
         return []
 
     _inject_x_cookies(context, auth_token, ct0)
     _, warm_err = _warm_x_session(page)
     if warm_err:
-        logger.warning(warm_err)
+        logger.info("X scraper auto-skipped: %s", warm_err)
         return []
 
     leads: list[dict] = []
@@ -727,8 +800,8 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
     # 5a. Joined X Communities timeline
     comm_items, status, err = _fetch_x_tweets(page, X_COMMUNITIES_URL)
     if err:
-        logger.warning("X Communities skipped: %s", err)
-        if "blocked" in err.lower() or "expired" in err.lower():
+        logger.info("X scraper auto-skipped on Communities: %s", err)
+        if any(tok in err.lower() for tok in ("blocked", "expired", "403", "login")):
             return []
     else:
         logger.info("X Communities -> HTTP %s | %d tweets", status, len(comm_items))
@@ -737,11 +810,10 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
             if is_post_processed(post_id):
                 continue
 
-            niche, category = _classify_text_to_niche(tw["text"])
+            niche, category = _classify_text_to_niche(tw["text"], allowed_niches=active_niches)
             if not niche:
                 continue
 
-            mark_post_processed(post_id, niche)
             logger.info("MATCHED LEAD [X | X Community | %s]: %.80s", niche, tw["text"])
             leads.append(
                 {
@@ -759,13 +831,15 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
                 }
             )
 
-    # 5b. High-intent live X search queries
+    # 5b. High-intent live X search queries (only queries relevant to active_niches)
     for entry in X_SEARCH_QUERIES:
+        if active_niches is not None and entry["niche"] not in active_niches:
+            continue
         search_url = X_SEARCH_URL.format(query=quote_plus(entry["query"]))
         tweets, status, err = _fetch_x_tweets(page, search_url)
         if err:
-            logger.warning("X Search (%s) skipped: %s", entry["niche"], err)
-            if "blocked" in err.lower() or "expired" in err.lower():
+            logger.info("X scraper auto-skipped on Search (%s): %s", entry["niche"], err)
+            if any(tok in err.lower() for tok in ("blocked", "expired", "403", "login")):
                 break
             continue
 
@@ -775,11 +849,10 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
             if is_post_processed(post_id):
                 continue
 
-            niche, category = _classify_text_to_niche(tw["text"])
+            niche, category = _classify_text_to_niche(tw["text"], allowed_niches=active_niches)
             resolved_niche = niche or entry["niche"]
             resolved_cat = category if niche else "client_lead"
 
-            mark_post_processed(post_id, resolved_niche)
             logger.info("MATCHED LEAD [X | X Search | %s]: %.80s", resolved_niche, tw["text"])
             leads.append(
                 {
@@ -861,17 +934,23 @@ def _fetch_x_tweets(page: Page, url: str) -> tuple[list[dict], int | None, str |
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _classify_text_to_niche(text: str) -> tuple[str | None, str]:
-    """Return (niche_key, category) for the first matching niche, or (None, 'client_lead')."""
+def _classify_text_to_niche(
+    text: str,
+    allowed_niches: set[str] | None = None,
+) -> tuple[str | None, str]:
+    """Return (niche_key, category) matching *allowed_niches* (or any niche if None)."""
     lowered = text.lower()
     for niche_key in ("seo_mkt", "web_dev", "ai_auto", "admin_growth"):
+        if allowed_niches is not None and niche_key not in allowed_niches:
+            continue
         keywords = NICHES.get(niche_key, {}).get("keywords", [])
         if any(kw.lower() in lowered for kw in keywords):
             category = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
             return niche_key, category
-    for q in DISTRIBUTOR_QUERIES:
-        if q.lower() in lowered:
-            return "admin_growth", "distributor_prospect"
+    if allowed_niches is None or "admin_growth" in allowed_niches:
+        for q in DISTRIBUTOR_QUERIES:
+            if q.lower() in lowered:
+                return "admin_growth", "distributor_prospect"
     return None, "client_lead"
 
 
@@ -891,9 +970,8 @@ def _matches_keywords(text: str, keywords: list[str]) -> bool:
 
 def _enrich_test_match(match: dict, niche: str) -> dict | None:
     """
-    Attach description snippet and Gemini-generated friendly public comment + DM
-    to a `/test_scrape` match. Never falls back to hardcoded generic templates.
-    Filters out posts that Gemini explicitly rejects (`is_buyer=False`) when Gemini is active.
+    Attach description snippet and AI-generated friendly public comment + DM
+    to a `/test_scrape` match. Filters out posts rejected as non-buyers (`is_buyer=False`).
     """
     desc = " ".join((match.get("selftext") or match.get("title") or "").split())
     if len(desc) > 400:
@@ -902,7 +980,11 @@ def _enrich_test_match(match: dict, niche: str) -> dict | None:
     match["suggested_comment"] = ""
     match["custom_dm"] = ""
 
-    if not GEMINI_API_KEY:
+    has_ai_key = bool(
+        (os.getenv("GROQ_API_KEY") or GROQ_API_KEY)
+        or (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY)
+    )
+    if not has_ai_key:
         return match
 
     try:
@@ -926,7 +1008,7 @@ def _enrich_test_match(match: dict, niche: str) -> dict | None:
             match["suggested_comment"] = q.get("suggested_comment", "")
             match["custom_dm"] = q.get("custom_dm", "")
     except Exception as exc:
-        logger.debug("Test match Gemini enrichment failed: %s", exc)
+        logger.debug("Test match AI enrichment failed: %s", exc)
 
     return match
 
@@ -1031,7 +1113,7 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
         platform_reports.append(
             {
                 "platform": "Reddit",
-                "badge": "🟠 Reddit (Combined RSS)",
+                "badge": "🟠 Reddit (Dual RSS)",
                 "status": rd_status,
                 "posts_scanned": rd_scanned,
                 "matches_found": rd_matches,
@@ -1072,12 +1154,14 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
             }
         )
 
-        # 4 & 5. Playwright platforms (Indie Hackers & X)
+        # 4 & 5. Playwright platforms (Indie Hackers & optional X)
         with sync_playwright() as pw:
             browser: Browser = _launch_browser(pw)
+            context: BrowserContext | None = None
+            page: Page | None = None
             try:
                 context = _new_stealth_context(browser)
-                page: Page = _new_fast_page(context)
+                page = _new_fast_page(context)
 
                 # 4. Indie Hackers (+ hydrate post body & author profile for matched posts)
                 ih_items, ih_status, ih_err = _fetch_indiehackers_items(page, INDIEHACKERS_NEWEST_URL)
@@ -1115,10 +1199,9 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     }
                 )
 
-                # 5. X / Twitter & Joined Communities (disabled unless ENABLE_X_SCRAPER=true)
-                x_enabled = os.getenv("ENABLE_X_SCRAPER", "").strip().lower() == "true" or ENABLE_X_SCRAPER
-                auth_token, ct0 = _get_x_credentials()
-                if not x_enabled:
+                # 5. X / Twitter & Joined Communities (cookie-optional, auto-skips cleanly)
+                x_should_run, x_skip_reason = _should_attempt_x()
+                if not x_should_run:
                     platform_reports.append(
                         {
                             "platform": "X",
@@ -1126,21 +1209,11 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                             "status": "Skipped",
                             "posts_scanned": 0,
                             "matches_found": 0,
-                            "error": "Disabled (set ENABLE_X_SCRAPER=true to enable)",
-                        }
-                    )
-                elif not auth_token or not ct0:
-                    platform_reports.append(
-                        {
-                            "platform": "X",
-                            "badge": "𝕏 X / Community",
-                            "status": "Skipped",
-                            "posts_scanned": 0,
-                            "matches_found": 0,
-                            "error": "X_AUTH_TOKEN / X_CT0 not set",
+                            "error": x_skip_reason,
                         }
                     )
                 else:
+                    auth_token, ct0 = _get_x_credentials()
                     _inject_x_cookies(context, auth_token, ct0)
                     warm_status, warm_err = _warm_x_session(page)
                     if warm_err:
@@ -1148,7 +1221,7 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                             {
                                 "platform": "X",
                                 "badge": "𝕏 X / Community",
-                                "status": warm_status or "Blocked",
+                                "status": "Skipped",
                                 "posts_scanned": 0,
                                 "matches_found": 0,
                                 "error": warm_err,
@@ -1196,7 +1269,20 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                             }
                         )
             finally:
-                browser.close()
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         qualified_matches: list[dict] = []
         for m in raw_matches[:8]:

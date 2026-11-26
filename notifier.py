@@ -132,11 +132,11 @@ def _format_platform_badge(post: dict) -> str:
     return f"🌐 {_escape_html(platform)}" + (f" ({_escape_html(group)})" if group else "")
 
 
-def _truncate_snippet(text: str, max_len: int = 400) -> str:
-    """Clean whitespace and truncate post description/snippet to ~400 chars."""
+def _truncate_snippet(text: str, max_len: int = 320) -> str:
+    """Clean whitespace and truncate post description/snippet."""
     cleaned = " ".join((text or "").split())
     if not cleaned:
-        return "(no description)"
+        return ""
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[: max_len - 3].rstrip() + "..."
@@ -148,7 +148,24 @@ def _format_author_line(post: dict) -> str:
     if author_url:
         label = _escape_html(author or author_url)
         return f"👤 <b>Author Profile:</b> <a href=\"{_escape_html(author_url)}\">{label}</a>\n"
+    if author:
+        return f"👤 <b>Author:</b> {_escape_html(author)}\n"
     return ""
+
+
+def _format_summary_and_desc(post: dict, q: dict) -> str:
+    """Format post summary and optional post description snippet cleanly."""
+    summary = " ".join((q.get("summary") or "").split())
+    raw_desc = _truncate_snippet(post.get("selftext") or post.get("body") or "")
+
+    lines: list[str] = []
+    if summary:
+        lines.append(f"💡 <b>Summary:</b> {_escape_html(summary)}\n")
+    if raw_desc and raw_desc.lower() != summary.lower():
+        lines.append(f"📄 <b>Description:</b> {_escape_html(raw_desc)}\n")
+    elif not summary:
+        lines.append("📄 <b>Description:</b> (no description)\n")
+    return "".join(lines)
 
 
 def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str:
@@ -157,7 +174,7 @@ def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str
     category = _escape_html(post.get("category", "agency_prospect"))
     score = int(q.get("intent_score", 0))
     safe_title = _escape_html(post.get("title", ""))
-    safe_desc = _escape_html(_truncate_snippet(post.get("selftext") or post.get("body") or q.get("summary", "")))
+    details_block = _format_summary_and_desc(post, q)
     safe_comment = _escape_html(q.get("suggested_comment") or "")
     custom_dm = _escape_html(q.get("custom_dm") or "")
     url = _escape_html(post.get("url", ""))
@@ -167,7 +184,7 @@ def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str
         f"🚀 <b>GLOBAL OUTREACH PROSPECT [{today_count}/{DAILY_OUTREACH_TARGET} Today]</b>\n"
         f"{badge} | 🎯 <b>Type:</b> {category} | ⚡ <b>Score:</b> {score}/10\n\n"
         f"📝 <b>Title:</b> {safe_title}\n"
-        f"📄 <b>Description:</b> {safe_desc}\n"
+        f"{details_block}"
         f"{author_line}\n"
         f"💬 <b>Friendly Public Comment:</b>\n<pre>{safe_comment}</pre>\n\n"
         f"✉️ <b>Natural Direct Message (DM):</b>\n<pre>{custom_dm}</pre>\n\n"
@@ -188,8 +205,7 @@ def _format_client_lead_message(post: dict, q: dict) -> str:
     badge = _format_platform_badge(post)
 
     safe_title = _escape_html(post.get("title", ""))
-    raw_desc = post.get("selftext") or post.get("body") or q.get("summary", "")
-    safe_desc = _escape_html(_truncate_snippet(raw_desc))
+    details_block = _format_summary_and_desc(post, q)
     safe_comment = _escape_html(q.get("suggested_comment") or "")
     safe_dm = _escape_html(q.get("custom_dm") or "")
     url = _escape_html(post.get("url", ""))
@@ -200,7 +216,7 @@ def _format_client_lead_message(post: dict, q: dict) -> str:
         f"{badge}\n"
         f"⚡ <b>Intent Score:</b> {score}/10  {score_bar}\n\n"
         f"📝 <b>Title:</b> {safe_title}\n"
-        f"📄 <b>Description:</b> {safe_desc}\n"
+        f"{details_block}"
         f"{author_line}\n"
         f"💬 <b>Friendly Public Comment:</b>\n"
         f"<pre>{safe_comment}</pre>\n\n"

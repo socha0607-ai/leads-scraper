@@ -9,15 +9,33 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
-# Credentials (loaded from .env)
+# Credentials & Runtime Settings (loaded from .env)
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_API_URL: str = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+GEMINI_FALLBACK_MODELS: list[str] = [
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+]
+
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID: str = os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
-CHECK_INTERVAL_MINUTES: int = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
-CHECK_INTERVAL_SECONDS: int = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-ENABLE_X_SCRAPER: bool = os.getenv("ENABLE_X_SCRAPER", "false").strip().lower() == "true"
+DB_PATH: str = os.getenv("DB_PATH", "/data/leads.db").strip() or "/data/leads.db"
+
+CHECK_INTERVAL_MINUTES: int = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
+CHECK_INTERVAL_SECONDS: int = int(
+    os.getenv("CHECK_INTERVAL_SECONDS", str(CHECK_INTERVAL_MINUTES * 60))
+)
+STARTUP_DELAY_SECONDS: int = int(os.getenv("STARTUP_DELAY_SECONDS", "6"))
+LEAD_RETENTION_DAYS: int = int(os.getenv("LEAD_RETENTION_DAYS", "14"))
+
+ENABLE_X_SCRAPER: bool = os.getenv("ENABLE_X_SCRAPER", "").strip().lower() == "true"
 DODO_PAYMENT_LINK: str = os.getenv(
     "DODO_PAYMENT_LINK",
     "https://checkout.dodopayments.com/buy/your_product_link_here",
@@ -147,6 +165,13 @@ NICHE_LABELS: dict[str, str] = {
     "admin_growth": "🔥 Admin Growth",
 }
 
+NICHE_DESCRIPTIONS: dict[str, str] = {
+    "web_dev": "Full-stack web apps, SaaS MVPs, landing pages, Shopify/WordPress, React/Next.js & UI/UX requests.",
+    "ai_auto": "Workflow automation, AI agents, chatbots, n8n/Make.com/Zapier builds, scraping & CRM integrations.",
+    "seo_mkt": "SEO audits, backlinks, Google/Meta ads, local SEO, organic traffic, ROAS & client growth requests.",
+    "admin_growth": "Agency growth, client acquisition, lead generation & B2B partnership prospects.",
+}
+
 # Combined list of all active intent keywords across niches
 INTENT_KEYWORDS: list[str] = [
     kw
@@ -199,14 +224,14 @@ X_SEARCH_QUERIES: list[dict[str, str]] = [
     },
 ]
 
-REDDIT_COMBINED_RSS_URL: str = os.getenv(
-    "REDDIT_COMBINED_RSS_URL",
-    "https://www.reddit.com/r/SEO+digital_marketing+marketing+smallbusiness+Entrepreneur+SaaS+forhire+webdev+n8n+Automate/new/.rss?limit=50",
-)
+REDDIT_RSS_URLS: list[str] = [
+    "https://www.reddit.com/r/SEO+digital_marketing+marketing+smallbusiness/new/.rss?limit=25",
+    "https://www.reddit.com/r/Entrepreneur+forhire+webdev+freelance/new/.rss?limit=25",
+]
+REDDIT_COMBINED_RSS_URL: str = os.getenv("REDDIT_COMBINED_RSS_URL", REDDIT_RSS_URLS[0])
 HN_API_URL: str = "https://hn.algolia.com/api/v1/search_by_date"
 INDIEHACKERS_NEWEST_URL: str = "https://www.indiehackers.com/newest"
-INDIEHACKERS_GROUPS_URL: str = "https://www.indiehackers.com/groups"
-PRODUCTHUNT_DISCUSSIONS_URL: str = "https://www.producthunt.com/discussions"
+PRODUCTHUNT_FEED_URL: str = "https://www.producthunt.com/feed"
 DDG_HTML_URL: str = "https://html.duckduckgo.com/html/"
 
 # ---------------------------------------------------------------------------

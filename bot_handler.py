@@ -28,8 +28,10 @@ apihelper.CONNECT_TIMEOUT = 15
 
 from config import (
     ADMIN_CHAT_ID,
+    CHECK_INTERVAL_MINUTES,
     DODO_PAYMENT_LINK,
     NICHES,
+    NICHE_DESCRIPTIONS,
     NICHE_LABELS,
     TELEGRAM_BOT_TOKEN,
     TRIAL_DAYS,
@@ -106,22 +108,57 @@ def _build_niche_keyboard() -> types.InlineKeyboardMarkup:
     return markup
 
 
+def _build_status_keyboard(include_upgrade: bool = True) -> types.InlineKeyboardMarkup:
+    """Build the status/confirmation inline keyboard with Change Field & Upgrade buttons."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🔄 Change Field / Niche", callback_data="change_niche"),
+    )
+    if include_upgrade:
+        markup.add(
+            types.InlineKeyboardButton("💳 Upgrade to Pro ($79/mo)", url=_get_payment_url()),
+        )
+    return markup
+
+
+def _safe_edit_or_send(chat_id: int, message_id: int, text: str, reply_markup) -> None:
+    """Edit an existing Telegram message cleanly, ignoring unchanged-message errors."""
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+        )
+    except apihelper.ApiTelegramException as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
 @bot.message_handler(commands=["start"])
 def handle_start(message: types.Message) -> None:
-    """Greet the user, show live subscription status if registered, and present niche/upgrade buttons."""
-    first_name = message.from_user.first_name if message.from_user else "there"
+    """Greet the user, show active field/plan banner if registered, and present field buttons."""
+    first_name = _escape_html(message.from_user.first_name) if (message.from_user and message.from_user.first_name) else "there"
     status = get_user_status(message.chat.id)
 
     status_banner = ""
     if status["exists"]:
+        current_label = NICHE_LABELS.get(status["niche"], status["niche"])
+        current_desc = NICHE_DESCRIPTIONS.get(status["niche"], "")
+        desc_line = f"📋 <b>Tracking:</b> {_escape_html(current_desc)}\n" if current_desc else ""
         if status["is_active"]:
             status_banner = (
-                f"🟢 <b>Plan:</b> {status['plan'].upper()} | "
+                f"🎯 <b>Current Active Field:</b> {current_label}\n"
+                f"{desc_line}"
+                f"🟢 System Active — Scanning every {CHECK_INTERVAL_MINUTES} minutes automatically\n"
+                f"💳 <b>Plan:</b> {status['plan'].upper()} | "
                 f"⏳ <b>Remaining:</b> {status['days_left']} days, {status['hours_left']} hours left\n\n"
             )
         else:
             status_banner = (
-                "🔴 <b>Plan:</b> EXPIRED | Upgrade below to resume real-time leads.\n\n"
+                f"🎯 <b>Last Field:</b> {current_label}\n"
+                f"🔴 <b>Plan:</b> EXPIRED | Upgrade below to resume real-time leads.\n\n"
             )
 
     text = (
@@ -130,7 +167,7 @@ def handle_start(message: types.Message) -> None:
         f"Get <b>real-time, AI-qualified B2B leads</b> across Reddit, X, Hacker News, "
         f"Indie Hackers &amp; Product Hunt — complete with intent scores and ready-to-send custom DMs.\n\n"
         f"🎁 Every new user starts with a <b>{TRIAL_DAYS}-Day Free Trial</b>.\n\n"
-        f"👇 <b>Choose your target niche below to start receiving leads:</b>"
+        f"👇 <b>Choose your target field / niche below (you can switch anytime via /start or /status):</b>"
     )
     bot.send_message(
         message.chat.id,
@@ -139,9 +176,27 @@ def handle_start(message: types.Message) -> None:
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data in ("change_niche", "change_field"))
+def handle_change_field_prompt(call: types.CallbackQuery) -> None:
+    """Prompt the user to pick a new target field / niche."""
+    bot.answer_callback_query(call.id, "Select your new target field below")
+    status = get_user_status(call.message.chat.id)
+    current_note = ""
+    if status["exists"]:
+        current_label = NICHE_LABELS.get(status["niche"], status["niche"])
+        current_note = f"🎯 <b>Current Field:</b> {current_label}\n\n"
+
+    text = (
+        f"{current_note}"
+        f"🔄 <b>Switch Target Field / Niche</b>\n\n"
+        f"Select a field below to update your tracker immediately:"
+    )
+    _safe_edit_or_send(call.message.chat.id, call.message.message_id, text, _build_niche_keyboard())
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("niche_"))
 def handle_niche_selection(call: types.CallbackQuery) -> None:
-    """Save the user's chosen niche and confirm their 5-day free trial is active."""
+    """Save the user's chosen niche immediately and confirm active scanning status."""
     niche = call.data.removeprefix("niche_")
     if niche not in NICHE_LABELS or niche == "admin_growth":
         bot.answer_callback_query(call.id, "Unknown niche selection.")
@@ -153,68 +208,83 @@ def handle_niche_selection(call: types.CallbackQuery) -> None:
     register_or_update_niche(chat_id=chat_id, username=username, niche=niche)
     status = get_user_status(chat_id)
     niche_label = NICHE_LABELS.get(niche, niche)
-    keywords = NICHES.get(niche, {}).get("keywords", [])
-    keywords_text = "\n".join(f"• <code>{kw}</code>" for kw in keywords)
+    niche_desc = NICHE_DESCRIPTIONS.get(niche, "")
+    keywords = NICHES.get(niche, {}).get("keywords", [])[:10]
+    keywords_text = ", ".join(f"<code>{_escape_html(kw)}</code>" for kw in keywords)
 
-    bot.answer_callback_query(call.id, f"Selected: {niche_label}")
+    bot.answer_callback_query(call.id, f"Active Field: {niche_label}")
 
     if status["is_active"]:
         plan_text = "PRO" if status["plan"] == "pro" else f"{TRIAL_DAYS}-Day Free Trial"
         confirm_text = (
-            f"✅ <b>Niche Set:</b> {niche_label}\n"
-            f"🟢 <b>Plan:</b> {plan_text} | ⏳ <b>Remaining:</b> {status['days_left']} days, {status['hours_left']} hours left\n\n"
-            f"🔍 <b>Active Keywords Tracked:</b>\n{keywords_text}\n\n"
-            f"Your scraper is active! High-intent leads will arrive here automatically.\n"
-            f"Use /status anytime to check your plan or /start to switch niches."
+            f"✅ <b>Active Field:</b> {niche_label}\n"
+            f"📋 <b>What's Tracked:</b> {_escape_html(niche_desc)}\n\n"
+            f"🟢 <b>Status:</b> System Active — Scanning every {CHECK_INTERVAL_MINUTES} minutes automatically\n"
+            f"💳 <b>Plan:</b> {plan_text} | ⏳ <b>Remaining:</b> {status['days_left']} days, {status['hours_left']} hours left\n\n"
+            f"🔍 <b>Top Keywords:</b> {keywords_text}\n\n"
+            f"ℹ️ High-intent buyer leads will be delivered here automatically. "
+            f"You can switch fields anytime via /start or /status."
         )
+        reply_markup = _build_status_keyboard(include_upgrade=(status["plan"] != "pro"))
     else:
         confirm_text = (
-            f"✅ <b>Niche Updated:</b> {niche_label}\n\n"
-            f"🔴 <b>Plan:</b> EXPIRED | Upgrade below to resume real-time leads.\n\n"
-            f"🔍 <b>Keywords for this niche:</b>\n{keywords_text}"
+            f"✅ <b>Field Updated:</b> {niche_label}\n"
+            f"📋 <b>What's Tracked:</b> {_escape_html(niche_desc)}\n\n"
+            f"🔴 <b>Status:</b> Plan EXPIRED | Upgrade below to resume automatic 15-minute scanning.\n\n"
+            f"🔍 <b>Top Keywords:</b> {keywords_text}\n\n"
+            f"ℹ️ You can switch fields anytime via /start or /status."
         )
+        reply_markup = _build_status_keyboard(include_upgrade=True)
 
-    bot.edit_message_text(
-        confirm_text,
-        chat_id=chat_id,
-        message_id=call.message.message_id,
-        reply_markup=_build_niche_keyboard(),
-    )
+    _safe_edit_or_send(chat_id, call.message.message_id, confirm_text, reply_markup)
 
 
 @bot.message_handler(commands=["status"])
 def handle_status(message: types.Message) -> None:
-    """Show the user's active niche, plan status, and exact remaining time."""
+    """Show the user's active field, tracking description, plan countdown, and Change Field button."""
     status = get_user_status(message.chat.id)
     if not status["exists"]:
         bot.send_message(
             message.chat.id,
-            "ℹ️ You haven't selected a niche yet. Send /start to activate your 5-Day Free Trial!",
+            "ℹ️ You haven't selected a target field yet. Choose a niche below or send /start to activate your 5-Day Free Trial!",
+            reply_markup=_build_niche_keyboard(),
         )
         return
 
     niche_label = NICHE_LABELS.get(status["niche"], status["niche"])
+    niche_desc = NICHE_DESCRIPTIONS.get(status["niche"], "")
+    desc_line = f"📋 <b>Tracking:</b> {_escape_html(niche_desc)}\n\n" if niche_desc else "\n"
 
     if status["is_active"]:
         text = (
             f"📊 <b>Your Account Status</b>\n\n"
-            f"🎯 <b>Active Niche:</b> {niche_label}\n"
-            f"🟢 <b>Plan:</b> {status['plan'].upper()}\n"
+            f"🎯 <b>Active Field:</b> {niche_label}\n"
+            f"{desc_line}"
+            f"🟢 <b>Status:</b> System Active — Scanning every {CHECK_INTERVAL_MINUTES} minutes automatically\n"
+            f"💳 <b>Plan:</b> {status['plan'].upper()}\n"
             f"⏳ <b>Remaining:</b> {status['days_left']} days, {status['hours_left']} hours left\n\n"
-            f"Send /start if you want to switch your target niche."
+            f"ℹ️ You can switch fields anytime via /start or the button below."
         )
-        bot.send_message(message.chat.id, text)
+        bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=_build_status_keyboard(include_upgrade=(status["plan"] != "pro")),
+        )
     else:
         text = (
             f"📊 <b>Your Account Status</b>\n\n"
-            f"🎯 <b>Niche:</b> {niche_label}\n"
-            f"🔴 <b>Plan:</b> EXPIRED\n\n"
-            f"🔒 Your 5-day free trial has ended. Upgrade below to resume real-time leads.\n"
-            f"Your Chat ID: <code>{message.chat.id}</code>"
+            f"🎯 <b>Selected Field:</b> {niche_label}\n"
+            f"{desc_line}"
+            f"🔴 <b>Status:</b> Plan EXPIRED\n\n"
+            f"🔒 Your 5-day free trial has ended. Upgrade below to resume automatic 15-minute scanning.\n"
+            f"Your Chat ID: <code>{message.chat.id}</code>\n\n"
+            f"ℹ️ You can switch fields anytime via /start or the button below."
         )
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(types.InlineKeyboardButton("💳 Upgrade to Pro ($79/mo)", url=_get_payment_url()))
-        bot.send_message(message.chat.id, text, reply_markup=markup)
+        bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=_build_status_keyboard(include_upgrade=True),
+        )
 
 
 @bot.message_handler(commands=["upgrade", "admin_add"])
@@ -334,12 +404,12 @@ def handle_test_scrape(message: types.Message) -> None:
                 comment_block = (
                     f"<pre>{_escape_html(m['suggested_comment'])}</pre>"
                     if m.get("suggested_comment")
-                    else "<i>(AI reply unavailable — check GEMINI_API_KEY)</i>"
+                    else "<i>(AI reply unavailable — check GROQ_API_KEY / GEMINI_API_KEY)</i>"
                 )
                 dm_block = (
                     f"<pre>{_escape_html(m['custom_dm'])}</pre>"
                     if m.get("custom_dm")
-                    else "<i>(AI DM unavailable — check GEMINI_API_KEY)</i>"
+                    else "<i>(AI DM unavailable — check GROQ_API_KEY / GEMINI_API_KEY)</i>"
                 )
                 card = (
                     f"<b>#{idx} Match</b> (keyword: <code>{_escape_html(m['matched_keyword'])}</code>{score_str})\n"
