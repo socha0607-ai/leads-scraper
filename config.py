@@ -70,6 +70,9 @@ NICHES: dict[str, dict[str, list[str]]] = {
     "admin_growth": {
         "subreddits": ["agency", "freelance", "webdev", "SEO", "marketing"],
         "keywords": [
+	    "need seo",
+	    "looking for marketing agency",
+	    "marketing",
             "how to get clients",
             "struggling to find clients",
             "cold email not working",
@@ -139,4 +142,4 @@ USER_AGENT: str = (
 # SaaS Trial & Qualification Thresholds
 # ---------------------------------------------------------------------------
 TRIAL_DAYS: int = 5
-MIN_INTENT_SCORE: int = 7
+MIN_INTENT_SCORE: int = 2
