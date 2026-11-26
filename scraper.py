@@ -37,12 +37,13 @@ from playwright.sync_api import (
 
 from config import (
     DISTRIBUTOR_QUERIES,
+    ENABLE_X_SCRAPER,
     GEMINI_API_KEY,
     HN_API_URL,
-    INDIEHACKERS_GROUPS_URL,
     INDIEHACKERS_NEWEST_URL,
     NICHES,
     PLAYWRIGHT_TIMEOUT_MS,
+    REDDIT_COMBINED_RSS_URL,
     USER_AGENT,
     X_AUTH_TOKEN,
     X_CT0,
@@ -52,8 +53,7 @@ from database import is_post_processed, mark_post_processed
 
 logger = logging.getLogger(__name__)
 
-REDDIT_RSS_URL = "https://www.reddit.com/r/{sub}/new/.rss"
-REDDIT_RSS_UA = "Mozilla/5.0 (compatible; IntentLeadRadar/1.0)"
+REDDIT_RSS_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 PRODUCTHUNT_FEED_URL = "https://www.producthunt.com/feed"
 
 STEALTH_USER_AGENT = (
@@ -161,21 +161,26 @@ def scrape_all_platforms() -> list[dict]:
         except Exception as exc:
             logger.warning("%s scraper failed: %s", name, exc)
 
-    # 2. Browser-based harvesters (Indie Hackers & X)
+    # 2. Browser-based harvesters (Indie Hackers main feed; X only if ENABLE_X_SCRAPER=true)
+    x_enabled = os.getenv("ENABLE_X_SCRAPER", "").strip().lower() == "true" or ENABLE_X_SCRAPER
     with sync_playwright() as pw:
         browser: Browser = _launch_browser(pw)
         try:
             context = _new_stealth_context(browser)
             page: Page = _new_fast_page(context)
 
-            for name, fn in (
-                ("Indie Hackers", lambda: scrape_indiehackers(page)),
-                ("X / Communities", lambda: scrape_x_global(context, page)),
-            ):
+            try:
+                leads.extend(scrape_indiehackers(page))
+            except Exception as exc:
+                logger.warning("Indie Hackers scraper failed: %s", exc)
+
+            if x_enabled:
                 try:
-                    leads.extend(fn())
+                    leads.extend(scrape_x_global(context, page))
                 except Exception as exc:
-                    logger.warning("%s scraper failed: %s", name, exc)
+                    logger.warning("X / Communities scraper failed: %s", exc)
+            else:
+                logger.debug("X scraper disabled (set ENABLE_X_SCRAPER=true to enable).")
         finally:
             browser.close()
 
@@ -188,21 +193,21 @@ scrape_subreddits = scrape_all_platforms
 
 
 # ---------------------------------------------------------------------------
-# 1. Reddit Public RSS Harvester (no login wall)
+# 1. Reddit Combined Public RSS Harvester (1 single request, no 429)
 # ---------------------------------------------------------------------------
 
-def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str | None]:
+def _fetch_combined_reddit_rss() -> tuple[list[dict], int | None, str | None]:
     """
-    Fetch posts from https://www.reddit.com/r/{subreddit}/new/.rss using requests
-    and xml.etree.ElementTree. Extracts title, full description, author, and URL.
+    Fetch all target subreddits in ONE combined RSS request
+    (`REDDIT_COMBINED_RSS_URL`), extracting each post's subreddit from
+    `<category term="...">`, title, cleaned body snippet, author, and URL.
     """
-    url = REDDIT_RSS_URL.format(sub=subreddit)
     headers = {
         "User-Agent": REDDIT_RSS_UA,
         "Accept": "application/atom+xml, application/xml, text/xml",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=12)
+        resp = requests.get(REDDIT_COMBINED_RSS_URL, headers=headers, timeout=15)
         status = resp.status_code
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
@@ -210,7 +215,7 @@ def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str
         return [], getattr(locals().get("resp"), "status_code", None), str(exc)
 
     posts: list[dict] = []
-    for entry in root.findall("atom:entry", _ATOM_NS)[:MAX_POSTS_PER_SUB]:
+    for entry in root.findall("atom:entry", _ATOM_NS):
         post_id = (entry.findtext("atom:id", default="", namespaces=_ATOM_NS) or "").strip()
         title = html.unescape(
             (entry.findtext("atom:title", default="", namespaces=_ATOM_NS) or "").strip()
@@ -220,6 +225,12 @@ def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str
 
         link_el = entry.find("atom:link", _ATOM_NS)
         post_url = (link_el.attrib.get("href", "") if link_el is not None else "").strip()
+
+        cat_el = entry.find("atom:category", _ATOM_NS)
+        subreddit = (cat_el.attrib.get("term", "") if cat_el is not None else "").strip()
+        if not subreddit and post_url:
+            m = re.search(r"/r/([^/]+)/", post_url, re.IGNORECASE)
+            subreddit = m.group(1) if m else "reddit"
 
         raw_author = (
             entry.findtext("atom:author/atom:name", default="", namespaces=_ATOM_NS) or ""
@@ -231,6 +242,7 @@ def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str
             posts.append(
                 {
                     "post_id": post_id,
+                    "subreddit": subreddit or "reddit",
                     "title": title,
                     "selftext": selftext,
                     "url": post_url,
@@ -245,7 +257,6 @@ def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str
 def _clean_reddit_rss_content(raw_html: str) -> str:
     """Extract clean post body text from Reddit RSS `<content>` HTML."""
     unescaped = html.unescape(raw_html)
-    # Remove trailing "submitted by /u/..." metadata block
     unescaped = re.sub(r"<!--\s*SC_OFF\s*-->", "", unescaped)
     unescaped = re.sub(r"<!--\s*SC_ON\s*-->.*$", "", unescaped, flags=re.DOTALL)
     text = _strip_html(unescaped)
@@ -253,61 +264,62 @@ def _clean_reddit_rss_content(raw_html: str) -> str:
 
 
 def scrape_reddit_global() -> list[dict]:
-    """Scrape all configured subreddits via Reddit's public `.rss` feeds."""
+    """Scrape all target subreddits in ONE combined RSS call."""
+    posts, status, err = _fetch_combined_reddit_rss()
+    if err:
+        logger.warning("Combined Reddit RSS failed (%s): %s", status, err)
+        return []
+
+    logger.info("Combined Reddit RSS -> HTTP %s | %d posts", status, len(posts))
     leads: list[dict] = []
-    sub_to_niches: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
 
-    for niche_key, cfg in NICHES.items():
-        keywords = cfg.get("keywords", [])
-        for sub in cfg.get("subreddits", []):
-            sub_to_niches[sub].append((niche_key, keywords))
-
-    for subreddit, niche_entries in sub_to_niches.items():
-        posts, status, err = _fetch_reddit_rss_posts(subreddit)
-        if err:
-            logger.warning("Reddit RSS r/%s failed (%s): %s", subreddit, status, err)
+    for item in posts:
+        post_id = item["post_id"]
+        if is_post_processed(post_id):
             continue
 
-        for item in posts:
-            post_id = item["post_id"]
-            if is_post_processed(post_id):
-                continue
+        subreddit = item["subreddit"]
+        combined = f"{item['title']} {item['selftext']}"
 
-            combined = f"{item['title']} {item['selftext']}"
-            matched_niches = [
-                niche_key
-                for niche_key, keywords in niche_entries
-                if _matches_keywords(combined, keywords)
-            ]
-            if not matched_niches:
-                mark_post_processed(post_id, "")
-                continue
+        # Prefer niches that explicitly track this subreddit, otherwise match any niche
+        preferred_niches = [
+            k for k, cfg in NICHES.items()
+            if any(s.lower() == subreddit.lower() for s in cfg.get("subreddits", []))
+        ]
+        candidate_niches = preferred_niches or list(NICHES.keys())
+        matched_niches = [
+            nk for nk in candidate_niches
+            if _matches_keywords(combined, NICHES[nk].get("keywords", []))
+        ]
+        if not matched_niches:
+            mark_post_processed(post_id, "")
+            continue
 
-            mark_post_processed(post_id, matched_niches[0])
-            for niche_key in matched_niches:
-                cat = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
-                logger.info(
-                    "MATCHED LEAD [Reddit | %s | %s] r/%s: %s",
-                    cat,
-                    niche_key,
-                    subreddit,
-                    item["title"],
-                )
-                leads.append(
-                    {
-                        "post_id": post_id,
-                        "niche": niche_key,
-                        "platform": "Reddit",
-                        "group_or_sub": f"r/{subreddit}",
-                        "category": cat,
-                        "subreddit": subreddit,
-                        "title": item["title"],
-                        "selftext": item["selftext"][:2000],
-                        "url": item["url"],
-                        "author": item["author"],
-                        "author_url": item["author_url"],
-                    }
-                )
+        mark_post_processed(post_id, matched_niches[0])
+        for niche_key in matched_niches:
+            cat = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
+            logger.info(
+                "MATCHED LEAD [Reddit | %s | %s] r/%s: %s",
+                cat,
+                niche_key,
+                subreddit,
+                item["title"],
+            )
+            leads.append(
+                {
+                    "post_id": post_id,
+                    "niche": niche_key,
+                    "platform": "Reddit",
+                    "group_or_sub": f"r/{subreddit}",
+                    "category": cat,
+                    "subreddit": subreddit,
+                    "title": item["title"],
+                    "selftext": item["selftext"][:2000],
+                    "url": item["url"],
+                    "author": item["author"],
+                    "author_url": item["author_url"],
+                }
+            )
 
     return leads
 
@@ -514,49 +526,45 @@ def scrape_producthunt() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def scrape_indiehackers(page: Page) -> list[dict]:
-    """Scrape indiehackers.com/newest & /groups, hydrating full post body & author profile."""
+    """Scrape indiehackers.com/newest (main feed), hydrating full post body & author profile."""
     leads: list[dict] = []
-    targets = [
-        (INDIEHACKERS_NEWEST_URL, "Indie Hackers"),
-        (INDIEHACKERS_GROUPS_URL, "IH Groups"),
-    ]
+    url, group_label = INDIEHACKERS_NEWEST_URL, "Indie Hackers"
 
-    for url, group_label in targets:
-        items, status, err = _fetch_indiehackers_items(page, url)
-        if err:
-            logger.warning("Indie Hackers (%s) error: %s", url, err)
+    items, status, err = _fetch_indiehackers_items(page, url)
+    if err:
+        logger.warning("Indie Hackers (%s) error: %s", url, err)
+        return []
+    logger.info("Indie Hackers (%s) -> HTTP %s | %d items", group_label, status, len(items))
+
+    for item in items:
+        post_id = "ih_" + hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:12]
+        if is_post_processed(post_id):
             continue
-        logger.info("Indie Hackers (%s) -> HTTP %s | %d items", group_label, status, len(items))
 
-        for item in items:
-            post_id = "ih_" + hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:12]
-            if is_post_processed(post_id):
-                continue
+        combined = f"{item['title']} {item['body']}"
+        niche, category = _classify_text_to_niche(combined)
+        if not niche:
+            continue
 
-            combined = f"{item['title']} {item['body']}"
-            niche, category = _classify_text_to_niche(combined)
-            if not niche:
-                continue
-
-            body, author, author_url = _hydrate_indiehackers_post(page, item["url"], item["title"])
-            final_body = body or item["body"]
-            mark_post_processed(post_id, niche)
-            logger.info("MATCHED LEAD [Indie Hackers | %s]: %.80s", niche, item["title"])
-            leads.append(
-                {
-                    "post_id": post_id,
-                    "niche": niche,
-                    "platform": "Indie Hackers",
-                    "group_or_sub": group_label,
-                    "category": category,
-                    "subreddit": group_label,
-                    "title": item["title"],
-                    "selftext": final_body[:2000],
-                    "url": item["url"],
-                    "author": author,
-                    "author_url": author_url,
-                }
-            )
+        body, author, author_url = _hydrate_indiehackers_post(page, item["url"], item["title"])
+        final_body = body or item["body"]
+        mark_post_processed(post_id, niche)
+        logger.info("MATCHED LEAD [Indie Hackers | %s]: %.80s", niche, item["title"])
+        leads.append(
+            {
+                "post_id": post_id,
+                "niche": niche,
+                "platform": "Indie Hackers",
+                "group_or_sub": group_label,
+                "category": category,
+                "subreddit": group_label,
+                "title": item["title"],
+                "selftext": final_body[:2000],
+                "url": item["url"],
+                "author": author,
+                "author_url": author_url,
+            }
+        )
 
     return leads
 
@@ -997,42 +1005,33 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
             }
         )
 
-        # 2. Reddit RSS (requests, no browser, no login wall)
-        rd_status: int | None = None
-        rd_scanned = 0
+        # 2. Combined Reddit RSS (1 single HTTP request, zero 429)
+        posts, rd_status, rd_err = _fetch_combined_reddit_rss()
+        rd_scanned = len(posts)
+        total_scanned += rd_scanned
         rd_matches = 0
-        rd_err: str | None = None
-        for sub in subreddits:
-            posts, sub_status, sub_err = _fetch_reddit_rss_posts(sub)
-            if sub_status:
-                rd_status = sub_status
-            if sub_err and not posts:
-                rd_err = sub_err
-                continue
-            rd_scanned += len(posts)
-            total_scanned += len(posts)
-            for item in posts:
-                combined = f"{item['title']} {item['selftext']}".lower()
-                matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
-                if matched_kw:
-                    rd_matches += 1
-                    raw_matches.append(
-                        {
-                            "platform": "Reddit",
-                            "group_or_sub": f"r/{sub}",
-                            "title": item["title"],
-                            "selftext": item["selftext"] or item["title"],
-                            "url": item["url"],
-                            "author": item["author"],
-                            "author_url": item["author_url"],
-                            "matched_keyword": matched_kw,
-                        }
-                    )
+        for item in posts:
+            combined = f"{item['title']} {item['selftext']}".lower()
+            matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
+            if matched_kw:
+                rd_matches += 1
+                raw_matches.append(
+                    {
+                        "platform": "Reddit",
+                        "group_or_sub": f"r/{item['subreddit']}",
+                        "title": item["title"],
+                        "selftext": item["selftext"] or item["title"],
+                        "url": item["url"],
+                        "author": item["author"],
+                        "author_url": item["author_url"],
+                        "matched_keyword": matched_kw,
+                    }
+                )
 
         platform_reports.append(
             {
                 "platform": "Reddit",
-                "badge": f"🟠 Reddit ({', '.join('r/' + s for s in subreddits)})",
+                "badge": "🟠 Reddit (Combined RSS)",
                 "status": rd_status,
                 "posts_scanned": rd_scanned,
                 "matches_found": rd_matches,
@@ -1116,9 +1115,21 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     }
                 )
 
-                # 5. X / Twitter & Joined Communities (x.com/home warm-up first)
+                # 5. X / Twitter & Joined Communities (disabled unless ENABLE_X_SCRAPER=true)
+                x_enabled = os.getenv("ENABLE_X_SCRAPER", "").strip().lower() == "true" or ENABLE_X_SCRAPER
                 auth_token, ct0 = _get_x_credentials()
-                if not auth_token or not ct0:
+                if not x_enabled:
+                    platform_reports.append(
+                        {
+                            "platform": "X",
+                            "badge": "𝕏 X / Community",
+                            "status": "Skipped",
+                            "posts_scanned": 0,
+                            "matches_found": 0,
+                            "error": "Disabled (set ENABLE_X_SCRAPER=true to enable)",
+                        }
+                    )
+                elif not auth_token or not ct0:
                     platform_reports.append(
                         {
                             "platform": "X",

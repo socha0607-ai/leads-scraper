@@ -15,8 +15,9 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID: str = os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
-CHECK_INTERVAL_MINUTES: int = int(os.getenv("CHECK_INTERVAL_MINUTES", "3"))
-CHECK_INTERVAL_SECONDS: int = int(os.getenv("CHECK_INTERVAL_SECONDS", "180"))
+CHECK_INTERVAL_MINUTES: int = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
+CHECK_INTERVAL_SECONDS: int = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+ENABLE_X_SCRAPER: bool = os.getenv("ENABLE_X_SCRAPER", "false").strip().lower() == "true"
 DODO_PAYMENT_LINK: str = os.getenv(
     "DODO_PAYMENT_LINK",
     "https://checkout.dodopayments.com/buy/your_product_link_here",
@@ -198,6 +199,10 @@ X_SEARCH_QUERIES: list[dict[str, str]] = [
     },
 ]
 
+REDDIT_COMBINED_RSS_URL: str = os.getenv(
+    "REDDIT_COMBINED_RSS_URL",
+    "https://www.reddit.com/r/SEO+digital_marketing+marketing+smallbusiness+Entrepreneur+SaaS+forhire+webdev+n8n+Automate/new/.rss?limit=50",
+)
 HN_API_URL: str = "https://hn.algolia.com/api/v1/search_by_date"
 INDIEHACKERS_NEWEST_URL: str = "https://www.indiehackers.com/newest"
 INDIEHACKERS_GROUPS_URL: str = "https://www.indiehackers.com/groups"

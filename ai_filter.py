@@ -161,9 +161,9 @@ def _is_not_found_error(exc: Exception) -> bool:
     return "404" in msg or "NOT_FOUND" in msg or "NOT FOUND" in msg
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
+def _is_transient_error(exc: Exception) -> bool:
     msg = str(exc).upper()
-    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "503" in msg or "UNAVAILABLE" in msg
 
 
 def _discover_flash_model(exclude: set[str]) -> str | None:
@@ -295,23 +295,28 @@ def qualify_leads_batch(posts: list[dict], bot_username: str = "") -> dict[str, 
     for model_name in _candidate_models():
         tried.add(model_name)
         try:
-            raw_items = _call_gemini_batch(model_name, prompt)
+            result = _call_gemini_batch(model_name, prompt)
             _ACTIVE_MODEL = model_name
-            logger.info("Batch-qualified %d candidates via %s -> %d buyer(s).", len(candidates), model_name, len(raw_items))
+            logger.info("Batch-qualified %d candidates via %s -> %d buyer(s).", len(candidates), model_name, len(raw_items) if (raw_items := result) is not None else 0)
             break
         except Exception as err:
             last_err = err
-            if _is_rate_limit_error(err):
-                logger.warning("Gemini 429 rate limit on '%s' — sleeping 12s and retrying once…", model_name)
-                time.sleep(12)
+            if _is_transient_error(err):
+                fallback_model = next((m for m in ("gemini-2.5-pro", "gemini-2.0-flash") if m != model_name), "gemini-2.0-flash")
+                logger.warning(
+                    "Gemini transient error (503/429) on '%s' — sleeping 5s and retrying once with '%s'…",
+                    model_name,
+                    fallback_model,
+                )
+                time.sleep(5)
                 try:
-                    raw_items = _call_gemini_batch(model_name, prompt)
-                    _ACTIVE_MODEL = model_name
-                    logger.info("Batch retry succeeded via %s -> %d buyer(s).", model_name, len(raw_items))
+                    raw_items = _call_gemini_batch(fallback_model, prompt)
+                    _ACTIVE_MODEL = fallback_model
+                    logger.info("Batch retry succeeded via %s -> %d buyer(s).", fallback_model, len(raw_items))
                     break
                 except Exception as retry_err:
                     last_err = retry_err
-                    logger.warning("Gemini retry failed on '%s': %s", model_name, retry_err)
+                    logger.warning("Gemini retry failed on '%s': %s", fallback_model, retry_err)
                     break
             if _is_not_found_error(err):
                 logger.warning("Gemini model '%s' returned 404/NOT_FOUND — trying next fallback.", model_name)
