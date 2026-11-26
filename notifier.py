@@ -132,14 +132,23 @@ def _format_platform_badge(post: dict) -> str:
     return f"🌐 {_escape_html(platform)}" + (f" ({_escape_html(group)})" if group else "")
 
 
-def _truncate_snippet(text: str, max_len: int = 360) -> str:
-    """Clean whitespace and truncate post description/snippet to ~360 chars."""
+def _truncate_snippet(text: str, max_len: int = 400) -> str:
+    """Clean whitespace and truncate post description/snippet to ~400 chars."""
     cleaned = " ".join((text or "").split())
     if not cleaned:
         return "(no description)"
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[: max_len - 3].rstrip() + "..."
+
+
+def _format_author_line(post: dict) -> str:
+    author_url = (post.get("author_url") or "").strip()
+    author = (post.get("author") or "").strip()
+    if author_url:
+        label = _escape_html(author or author_url)
+        return f"👤 <b>Author Profile:</b> <a href=\"{_escape_html(author_url)}\">{label}</a>\n"
+    return ""
 
 
 def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str:
@@ -149,17 +158,19 @@ def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str
     score = int(q.get("intent_score", 0))
     safe_title = _escape_html(post.get("title", ""))
     safe_desc = _escape_html(_truncate_snippet(post.get("selftext") or post.get("body") or q.get("summary", "")))
-    safe_comment = _escape_html(q.get("suggested_comment") or q.get("custom_dm", ""))
-    custom_dm = _escape_html(q.get("custom_dm", ""))
+    safe_comment = _escape_html(q.get("suggested_comment") or "")
+    custom_dm = _escape_html(q.get("custom_dm") or "")
     url = _escape_html(post.get("url", ""))
+    author_line = _format_author_line(post)
 
     msg = (
         f"🚀 <b>GLOBAL OUTREACH PROSPECT [{today_count}/{DAILY_OUTREACH_TARGET} Today]</b>\n"
         f"{badge} | 🎯 <b>Type:</b> {category} | ⚡ <b>Score:</b> {score}/10\n\n"
         f"📝 <b>Title:</b> {safe_title}\n"
-        f"📄 <b>Description:</b> {safe_desc}\n\n"
-        f"💬 <b>Suggested Public Comment:</b>\n<pre>{safe_comment}</pre>\n\n"
-        f"✉️ <b>Suggested Direct Message (DM):</b>\n<pre>{custom_dm}</pre>\n\n"
+        f"📄 <b>Description:</b> {safe_desc}\n"
+        f"{author_line}\n"
+        f"💬 <b>Friendly Public Comment:</b>\n<pre>{safe_comment}</pre>\n\n"
+        f"✉️ <b>Natural Direct Message (DM):</b>\n<pre>{custom_dm}</pre>\n\n"
         f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
     )
 
@@ -179,19 +190,21 @@ def _format_client_lead_message(post: dict, q: dict) -> str:
     safe_title = _escape_html(post.get("title", ""))
     raw_desc = post.get("selftext") or post.get("body") or q.get("summary", "")
     safe_desc = _escape_html(_truncate_snippet(raw_desc))
-    safe_comment = _escape_html(q.get("suggested_comment") or q.get("custom_dm", ""))
-    safe_dm = _escape_html(q.get("custom_dm", ""))
+    safe_comment = _escape_html(q.get("suggested_comment") or "")
+    safe_dm = _escape_html(q.get("custom_dm") or "")
     url = _escape_html(post.get("url", ""))
+    author_line = _format_author_line(post)
 
     msg = (
         f"🚨 <b>New High-Intent Lead ({niche_label})</b>\n\n"
         f"{badge}\n"
         f"⚡ <b>Intent Score:</b> {score}/10  {score_bar}\n\n"
         f"📝 <b>Title:</b> {safe_title}\n"
-        f"📄 <b>Description:</b> {safe_desc}\n\n"
-        f"💬 <b>Suggested Public Comment:</b>\n"
+        f"📄 <b>Description:</b> {safe_desc}\n"
+        f"{author_line}\n"
+        f"💬 <b>Friendly Public Comment:</b>\n"
         f"<pre>{safe_comment}</pre>\n\n"
-        f"✉️ <b>Suggested Direct Message (DM):</b>\n"
+        f"✉️ <b>Natural Direct Message (DM):</b>\n"
         f"<pre>{safe_dm}</pre>\n\n"
         f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
     )

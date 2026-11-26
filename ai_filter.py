@@ -33,6 +33,7 @@ class QualificationResult(TypedDict):
     is_buyer: bool
     intent_score: int
     summary: str
+    suggested_comment: str
     custom_dm: str
 
 
@@ -42,8 +43,9 @@ _RESPONSE_SCHEMA = {
         "is_buyer": {
             "type": "boolean",
             "description": (
-                "true ONLY if the author fits the target lead/prospect profile "
-                "with genuine intent. false for spam or unrelated posts."
+                "true ONLY if the author is genuinely asking for help, recommendations, "
+                "or services. false for technical news, research papers (e.g. LLM papers "
+                "mentioning 'audit'), self-promotion, or unrelated posts."
             ),
         },
         "intent_score": {
@@ -54,22 +56,39 @@ _RESPONSE_SCHEMA = {
             "type": "string",
             "description": "One-sentence summary of what the person needs or is looking for.",
         },
+        "suggested_comment": {
+            "type": "string",
+            "description": (
+                "Conversational, warm, genuinely helpful 2-3 sentence public comment "
+                "referencing a specific detail from their post. Zero sales pitch or "
+                "buzzwords; sounds like a peer founder or engineer helping out."
+            ),
+        },
         "custom_dm": {
             "type": "string",
-            "description": "Short, non-spammy, tailored 3-sentence outreach pitch.",
+            "description": (
+                "Casual, personalized 2-sentence direct message referencing their exact "
+                "project or problem and offering one specific helpful tip. Never automated or spammy."
+            ),
         },
     },
-    "required": ["is_buyer", "intent_score", "summary", "custom_dm"],
+    "required": ["is_buyer", "intent_score", "summary", "suggested_comment", "custom_dm"],
 }
 
 _CLIENT_SYSTEM_PROMPT = (
-    "You are an expert B2B sales qualifier helping agencies and freelancers in the "
-    "{niche_label} space identify high-intent inbound buyer leads across Reddit, X, "
-    "Hacker News, Indie Hackers, and Product Hunt. "
-    "Set is_buyer=true ONLY if the author is actively looking to hire or pay for a "
-    "service (not a freelancer promoting themselves, not spamming). Draft a helpful, "
-    "non-salesy 3-sentence outreach DM/reply tailored to their exact problem and platform. "
-    "Return ONLY JSON."
+    "You are an expert B2B lead qualifier helping founders, engineers, and consultants in the "
+    "{niche_label} space spot real people asking for help across Reddit, X, Hacker News, "
+    "Indie Hackers, and Product Hunt.\n"
+    "STRICT QUALIFICATION: Set is_buyer=true ONLY when the post shows someone genuinely asking "
+    "for help, recommendations, feedback, or services. Set is_buyer=false for random technical "
+    "news, research papers (like sandboxed LLM papers that merely contain 'audit'), product announcements "
+    "with no help request, or freelancers promoting themselves.\n"
+    "REPLY STYLE: Read the actual title and description carefully and write:\n"
+    "1. `suggested_comment`: Conversational, warm, genuinely helpful (2-3 sentences max), "
+    "referencing a specific detail from their post, zero sales pitch or buzzwords, sounding like a peer founder/engineer helping out.\n"
+    "2. `custom_dm`: Casual, personalized 2-sentence outreach referencing their exact project/problem "
+    "and offering one specific helpful tip — never sounding automated or spammy.\n"
+    "Return ONLY valid JSON."
 )
 
 _AGENCY_PROSPECT_SYSTEM_PROMPT = (
@@ -153,12 +172,15 @@ def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult | No
 
 def _build_prompt(post: dict) -> str:
     group_or_sub = post.get("group_or_sub") or post.get("subreddit") or "unknown"
+    body = post.get("selftext") or post.get("body") or "(no description)"
     return (
         f"Platform: {post.get('platform', 'Reddit')}\n"
         f"Group/Source: {group_or_sub}\n"
+        f"Author: {post.get('author') or 'unknown'}\n"
         f"Category: {post.get('category', 'client_lead')}\n"
         f"Niche: {post.get('niche', 'unknown')}\n"
         f"Title: {post.get('title', '')}\n"
-        f"Body:\n{post.get('selftext', post.get('body', '(no body)'))}\n\n"
-        "Analyse the above post and return a JSON object matching the schema."
+        f"Description:\n{body}\n\n"
+        "Analyse the above post carefully. Only set is_buyer=true if the author is genuinely "
+        "asking for help, recommendations, or services. Return a JSON object matching the schema."
     )

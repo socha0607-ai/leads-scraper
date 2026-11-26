@@ -1,28 +1,26 @@
 """
-scraper.py — Multi-Platform Global Harvester (Reddit, X, Hacker News, Indie Hackers, Product Hunt).
+scraper.py — Multi-Platform Global Harvester (Reddit RSS, Product Hunt Feed, Hacker News API,
+Indie Hackers Playwright + Post Hydration, and Authenticated X / Communities).
 
 Combines five scraping engines into `scrape_all_platforms()`:
-  1. `scrape_hackernews_api()`        — Fast JSON API via hn.algolia.com (last 24h, no browser)
-  2. `scrape_reddit_global(page)`     — Playwright on old.reddit.com/r/{sub}/new/ & old.reddit.com/search
-  3. `scrape_indiehackers(page)`      — Playwright on indiehackers.com/newest & /groups
-  4. `scrape_producthunt(page)`       — Playwright on producthunt.com/discussions
-  5. `scrape_x_global(context, page)` — Authenticated Playwright on x.com/search (live) & /i/communities
+  1. `scrape_hackernews_api()`        — Fast JSON API via hn.algolia.com (last 24h, with author profile URL)
+  2. `scrape_reddit_global()`         — Reddit public RSS feeds (reddit.com/r/{sub}/new/.rss)
+  3. `scrape_producthunt()`           — Product Hunt public feed (producthunt.com/feed)
+  4. `scrape_indiehackers(page)`      — Playwright on indiehackers.com/newest & /groups + post body/author hydration
+  5. `scrape_x_global(context, page)` — Stealth Playwright on x.com/home -> /search & /i/communities
 
 Global Playwright Speed Optimization:
   - Blocks `image`, `stylesheet`, `font`, and `media` requests via `page.route("**/*", ...)`.
   - Uses `wait_until="domcontentloaded"` with `timeout=15000` everywhere.
-
-Every item is deduplicated against `leads.db` and tagged with:
-  - `platform`: "Reddit" | "X" | "Hacker News" | "Indie Hackers" | "Product Hunt"
-  - `group_or_sub`: e.g. "r/SEO", "X Community", "Ask HN", "Indie Hackers", "Product Hunt"
-  - `category`: "client_lead" | "agency_prospect" | "distributor_prospect"
 """
 
 import hashlib
+import html
 import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -38,14 +36,13 @@ from playwright.sync_api import (
 )
 
 from config import (
-    ADMIN_GLOBAL_QUERIES,
     DISTRIBUTOR_QUERIES,
+    GEMINI_API_KEY,
     HN_API_URL,
     INDIEHACKERS_GROUPS_URL,
     INDIEHACKERS_NEWEST_URL,
     NICHES,
     PLAYWRIGHT_TIMEOUT_MS,
-    PRODUCTHUNT_DISCUSSIONS_URL,
     USER_AGENT,
     X_AUTH_TOKEN,
     X_CT0,
@@ -55,10 +52,9 @@ from database import is_post_processed, mark_post_processed
 
 logger = logging.getLogger(__name__)
 
-OLD_REDDIT_NEW_URL = "https://old.reddit.com/r/{sub}/new/"
-OLD_REDDIT_JSON_URL = "https://old.reddit.com/r/{sub}/new.json?limit=25"
-OLD_REDDIT_SEARCH_URL = "https://old.reddit.com/search?q={query}&sort=new&t=day"
-OLD_REDDIT_BASE = "https://old.reddit.com"
+REDDIT_RSS_URL = "https://www.reddit.com/r/{sub}/new/.rss"
+REDDIT_RSS_UA = "Mozilla/5.0 (compatible; IntentLeadRadar/1.0)"
+PRODUCTHUNT_FEED_URL = "https://www.producthunt.com/feed"
 
 STEALTH_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -66,18 +62,34 @@ STEALTH_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+X_HOME_URL = "https://x.com/home"
 X_SEARCH_URL = "https://x.com/search?q={query}&f=live"
 X_COMMUNITIES_URL = "https://x.com/i/communities"
-PH_GRAPHQL_URL = "https://www.producthunt.com/frontend/graphql"
 
 MAX_POSTS_PER_SUB = 25
-MAX_SEARCH_RESULTS = 15
 NAV_TIMEOUT_MS = PLAYWRIGHT_TIMEOUT_MS  # 15000 ms
 SETTLE_WAIT_MS = 1_500
 BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
-_COMMENT_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.IGNORECASE)
-_SUBREDDIT_RE = re.compile(r"/r/([^/]+)/", re.IGNORECASE)
+_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+_IH_RESERVED_SLUGS = {
+    "post",
+    "posts",
+    "groups",
+    "group",
+    "newest",
+    "top",
+    "product",
+    "products",
+    "start",
+    "about",
+    "login",
+    "signup",
+    "settings",
+    "search",
+    "newsletter",
+    "podcast",
+}
 
 
 def _block_heavy_assets(route: Route) -> None:
@@ -133,18 +145,23 @@ def _new_stealth_context(browser: Browser) -> BrowserContext:
 
 def scrape_all_platforms() -> list[dict]:
     """
-    Run all five platform harvesters (Hacker News, Reddit, Indie Hackers,
-    Product Hunt, and authenticated X / Communities) and return deduplicated leads.
+    Run all five platform harvesters (Hacker News, Reddit RSS, Product Hunt Feed,
+    Indie Hackers, and authenticated X / Communities) and return deduplicated leads.
     """
     leads: list[dict] = []
 
-    # 1. Fast JSON API: Hacker News (no browser needed)
-    try:
-        leads.extend(scrape_hackernews_api())
-    except Exception as exc:
-        logger.warning("Hacker News scraper failed: %s", exc)
+    # 1. Fast HTTP/API harvesters (no browser needed)
+    for name, fn in (
+        ("Hacker News", scrape_hackernews_api),
+        ("Reddit RSS", scrape_reddit_global),
+        ("Product Hunt Feed", scrape_producthunt),
+    ):
+        try:
+            leads.extend(fn())
+        except Exception as exc:
+            logger.warning("%s scraper failed: %s", name, exc)
 
-    # 2. Browser-based harvesters with stealth context, asset blocking & 15s timeout
+    # 2. Browser-based harvesters (Indie Hackers & X)
     with sync_playwright() as pw:
         browser: Browser = _launch_browser(pw)
         try:
@@ -152,9 +169,7 @@ def scrape_all_platforms() -> list[dict]:
             page: Page = _new_fast_page(context)
 
             for name, fn in (
-                ("Reddit", lambda: scrape_reddit_global(page)),
                 ("Indie Hackers", lambda: scrape_indiehackers(page)),
-                ("Product Hunt", lambda: scrape_producthunt(page)),
                 ("X / Communities", lambda: scrape_x_global(context, page)),
             ):
                 try:
@@ -173,290 +188,127 @@ scrape_subreddits = scrape_all_platforms
 
 
 # ---------------------------------------------------------------------------
-# 1. Reddit Global Harvester (old.reddit.com ONLY)
+# 1. Reddit Public RSS Harvester (no login wall)
 # ---------------------------------------------------------------------------
 
-def scrape_reddit_global(page: Page) -> list[dict]:
+def _fetch_reddit_rss_posts(subreddit: str) -> tuple[list[dict], int | None, str | None]:
     """
-    Scrape targeted subreddits on old.reddit.com/r/{sub}/new/ and
-    old.reddit.com/search (t=day) across all niche keywords.
+    Fetch posts from https://www.reddit.com/r/{subreddit}/new/.rss using requests
+    and xml.etree.ElementTree. Extracts title, full description, author, and URL.
     """
-    leads: list[dict] = []
-
-    sub_to_niches: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
-    search_jobs: list[tuple[str, str, str]] = []
-    seen_queries: set[tuple[str, str]] = set()
-
-    for niche_key, cfg in NICHES.items():
-        keywords = cfg.get("keywords", [])
-        category = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
-        for sub in cfg.get("subreddits", []):
-            sub_to_niches[sub].append((niche_key, keywords))
-        for kw in keywords[:6]:
-            if (kw.lower(), category) not in seen_queries:
-                seen_queries.add((kw.lower(), category))
-                search_jobs.append((kw, niche_key, category))
-
-    for q in ADMIN_GLOBAL_QUERIES:
-        if (q.lower(), "agency_prospect") not in seen_queries:
-            seen_queries.add((q.lower(), "agency_prospect"))
-            search_jobs.append((q, "admin_growth", "agency_prospect"))
-
-    for q in DISTRIBUTOR_QUERIES:
-        if (q.lower(), "distributor_prospect") not in seen_queries:
-            seen_queries.add((q.lower(), "distributor_prospect"))
-            search_jobs.append((q, "admin_growth", "distributor_prospect"))
-
-    for subreddit, niche_entries in sub_to_niches.items():
-        try:
-            leads.extend(_scrape_reddit_subreddit(page, subreddit, niche_entries))
-        except Exception as exc:
-            logger.warning("Failed to scrape r/%s: %s", subreddit, exc)
-
-    for query, niche_key, category in search_jobs:
-        try:
-            leads.extend(_scrape_reddit_search_query(page, query, niche_key, category))
-        except Exception as exc:
-            logger.warning("Failed Reddit global search '%s': %s", query, exc)
-
-    return leads
-
-
-def _fetch_reddit_subreddit_posts(
-    page: Page,
-    subreddit: str,
-) -> tuple[list[dict], int | None, str | None]:
-    """
-    Fetch posts from old.reddit.com/r/{sub}/new.json?limit=25 with a realistic
-    User-Agent, falling back to Playwright HTML parsing on old.reddit.com/r/{sub}/new/.
-    Returns (posts, status_code, error). Each post has post_id, title, selftext, url.
-    """
-    json_url = OLD_REDDIT_JSON_URL.format(sub=subreddit)
+    url = REDDIT_RSS_URL.format(sub=subreddit)
     headers = {
-        "User-Agent": STEALTH_USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": REDDIT_RSS_UA,
+        "Accept": "application/atom+xml, application/xml, text/xml",
     }
-    status_code: int | None = None
-
     try:
-        resp = requests.get(json_url, headers=headers, timeout=10)
-        status_code = resp.status_code
-        if resp.status_code == 200:
-            children = resp.json().get("data", {}).get("children", [])
-            posts: list[dict] = []
-            for child in children[:MAX_POSTS_PER_SUB]:
-                data = child.get("data") or {}
-                post_id = data.get("name") or (f"t3_{data['id']}" if data.get("id") else "")
-                title = (data.get("title") or "").strip()
-                selftext = (data.get("selftext") or "").strip()
-                permalink = data.get("permalink") or ""
-                full_url = (
-                    f"{OLD_REDDIT_BASE}{permalink}"
-                    if permalink.startswith("/")
-                    else (data.get("url") or "")
-                )
-                if post_id and title:
-                    posts.append(
-                        {
-                            "post_id": post_id,
-                            "title": title,
-                            "selftext": selftext,
-                            "url": full_url,
-                        }
-                    )
-            if posts:
-                return posts, status_code, None
+        resp = requests.get(url, headers=headers, timeout=12)
+        status = resp.status_code
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
     except Exception as exc:
-        logger.debug("Reddit JSON fetch failed for r/%s (%s) — trying HTML.", subreddit, exc)
+        return [], getattr(locals().get("resp"), "status_code", None), str(exc)
 
-    # Fallback: Playwright on old.reddit.com/r/{sub}/new/
-    html_url = OLD_REDDIT_NEW_URL.format(sub=subreddit)
-    try:
-        pw_resp = page.goto(html_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        status_code = pw_resp.status if pw_resp else status_code
-        page.wait_for_timeout(SETTLE_WAIT_MS)
-        if "/login" in page.url:
-            return [], status_code, "old.reddit.com login wall"
+    posts: list[dict] = []
+    for entry in root.findall("atom:entry", _ATOM_NS)[:MAX_POSTS_PER_SUB]:
+        post_id = (entry.findtext("atom:id", default="", namespaces=_ATOM_NS) or "").strip()
+        title = html.unescape(
+            (entry.findtext("atom:title", default="", namespaces=_ATOM_NS) or "").strip()
+        )
+        raw_content = entry.findtext("atom:content", default="", namespaces=_ATOM_NS) or ""
+        selftext = _clean_reddit_rss_content(raw_content)
 
-        posts = []
-        for el in page.query_selector_all("div.thing:not(.promoted)")[:MAX_POSTS_PER_SUB]:
-            post_id = el.get_attribute("data-fullname") or ""
-            title_el = el.query_selector("a.title")
-            if not post_id or not title_el:
-                continue
-            title = (title_el.inner_text() or "").strip()
-            raw_href = title_el.get_attribute("href") or ""
-            expando = el.query_selector("div.expando div.usertext-body")
-            selftext = (expando.inner_text() or "").strip() if expando else ""
+        link_el = entry.find("atom:link", _ATOM_NS)
+        post_url = (link_el.attrib.get("href", "") if link_el is not None else "").strip()
+
+        raw_author = (
+            entry.findtext("atom:author/atom:name", default="", namespaces=_ATOM_NS) or ""
+        ).strip()
+        author = raw_author.removeprefix("/u/").removeprefix("u/").strip()
+        author_url = f"https://www.reddit.com/user/{author}" if author else ""
+
+        if post_id and title:
             posts.append(
                 {
                     "post_id": post_id,
                     "title": title,
                     "selftext": selftext,
-                    "url": _normalise_old_reddit_url(raw_href),
+                    "url": post_url,
+                    "author": author,
+                    "author_url": author_url,
                 }
             )
-        return posts, status_code, None
-    except PWTimeout:
-        return [], status_code, f"Timeout navigating to r/{subreddit}"
-    except Exception as exc:
-        return [], status_code, str(exc)
+
+    return posts, status, None
 
 
-def _scrape_reddit_subreddit(
-    page: Page,
-    subreddit: str,
-    niche_entries: list[tuple[str, list[str]]],
-) -> list[dict]:
-    """Fetch r/{sub} via old.reddit.com JSON/HTML and harvest keyword-matched posts."""
-    logger.info("Visiting old.reddit.com/r/%s/new.json …", subreddit)
-    raw_posts, _, err = _fetch_reddit_subreddit_posts(page, subreddit)
-    if err:
-        logger.warning("Reddit r/%s skipped: %s", subreddit, err)
-        return []
+def _clean_reddit_rss_content(raw_html: str) -> str:
+    """Extract clean post body text from Reddit RSS `<content>` HTML."""
+    unescaped = html.unescape(raw_html)
+    # Remove trailing "submitted by /u/..." metadata block
+    unescaped = re.sub(r"<!--\s*SC_OFF\s*-->", "", unescaped)
+    unescaped = re.sub(r"<!--\s*SC_ON\s*-->.*$", "", unescaped, flags=re.DOTALL)
+    text = _strip_html(unescaped)
+    return " ".join(text.split())
 
+
+def scrape_reddit_global() -> list[dict]:
+    """Scrape all configured subreddits via Reddit's public `.rss` feeds."""
     leads: list[dict] = []
-    for item in raw_posts:
-        post_id = item["post_id"]
-        if is_post_processed(post_id):
+    sub_to_niches: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
+
+    for niche_key, cfg in NICHES.items():
+        keywords = cfg.get("keywords", [])
+        for sub in cfg.get("subreddits", []):
+            sub_to_niches[sub].append((niche_key, keywords))
+
+    for subreddit, niche_entries in sub_to_niches.items():
+        posts, status, err = _fetch_reddit_rss_posts(subreddit)
+        if err:
+            logger.warning("Reddit RSS r/%s failed (%s): %s", subreddit, status, err)
             continue
 
-        combined = f"{item['title']} {item['selftext']}"
-        matched_niches = [
-            niche_key
-            for niche_key, keywords in niche_entries
-            if _matches_keywords(combined, keywords)
-        ]
-        if not matched_niches:
-            mark_post_processed(post_id, "")
-            continue
-
-        selftext = item["selftext"] or _fetch_post_body(page, item["url"])
-        primary_niche = matched_niches[0]
-        mark_post_processed(post_id, primary_niche)
-
-        for niche_key in matched_niches:
-            cat = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
-            logger.info(
-                "MATCHED LEAD [Reddit | %s | %s] r/%s: %s",
-                cat,
-                niche_key,
-                subreddit,
-                item["title"],
-            )
-            leads.append(
-                {
-                    "post_id": post_id,
-                    "niche": niche_key,
-                    "platform": "Reddit",
-                    "group_or_sub": f"r/{subreddit}",
-                    "category": cat,
-                    "subreddit": subreddit,
-                    "title": item["title"],
-                    "selftext": selftext[:2000],
-                    "url": item["url"],
-                }
-            )
-
-    return leads
-
-
-def _scrape_reddit_search_query(
-    page: Page,
-    query: str,
-    niche_key: str,
-    category: str,
-) -> list[dict]:
-    """Search old.reddit.com/search (last 24h) for *query*."""
-    url = OLD_REDDIT_SEARCH_URL.format(query=quote_plus(query))
-    logger.info("Searching old.reddit.com (24h) [%s]: '%s' …", category, query)
-
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    except PWTimeout:
-        logger.warning("Timeout on Reddit search '%s' — skipping.", query)
-        return []
-
-    page.wait_for_timeout(SETTLE_WAIT_MS)
-    elements = page.query_selector_all("div.search-result")
-    if not elements:
-        elements = page.query_selector_all("div.thing:not(.promoted)")
-
-    candidates: list[dict] = []
-    for el in elements[:MAX_SEARCH_RESULTS]:
-        try:
-            title_el = el.query_selector("a.search-title") or el.query_selector("a.title")
-            if not title_el:
+        for item in posts:
+            post_id = item["post_id"]
+            if is_post_processed(post_id):
                 continue
 
-            title = (title_el.inner_text() or "").strip()
-            raw_href = title_el.get_attribute("href") or ""
-
-            post_id = el.get_attribute("data-fullname") or _extract_post_id(raw_href)
-            if not post_id or is_post_processed(post_id):
+            combined = f"{item['title']} {item['selftext']}"
+            matched_niches = [
+                niche_key
+                for niche_key, keywords in niche_entries
+                if _matches_keywords(combined, keywords)
+            ]
+            if not matched_niches:
+                mark_post_processed(post_id, "")
                 continue
 
-            sub_el = el.query_selector("a.search-subreddit-link") or el.query_selector("a.subreddit")
-            subreddit = ""
-            if sub_el:
-                subreddit = (sub_el.inner_text() or "").strip().removeprefix("r/")
-            if not subreddit:
-                subreddit = _extract_subreddit(raw_href) or "reddit"
+            mark_post_processed(post_id, matched_niches[0])
+            for niche_key in matched_niches:
+                cat = "agency_prospect" if niche_key == "admin_growth" else "client_lead"
+                logger.info(
+                    "MATCHED LEAD [Reddit | %s | %s] r/%s: %s",
+                    cat,
+                    niche_key,
+                    subreddit,
+                    item["title"],
+                )
+                leads.append(
+                    {
+                        "post_id": post_id,
+                        "niche": niche_key,
+                        "platform": "Reddit",
+                        "group_or_sub": f"r/{subreddit}",
+                        "category": cat,
+                        "subreddit": subreddit,
+                        "title": item["title"],
+                        "selftext": item["selftext"][:2000],
+                        "url": item["url"],
+                        "author": item["author"],
+                        "author_url": item["author_url"],
+                    }
+                )
 
-            old_permalink = _normalise_old_reddit_url(raw_href)
-            candidates.append(
-                {
-                    "post_id": post_id,
-                    "subreddit": subreddit,
-                    "group_or_sub": f"r/{subreddit}",
-                    "title": title,
-                    "permalink": old_permalink,
-                    "old_permalink": old_permalink,
-                    "matched_niches": [niche_key],
-                    "category": category,
-                }
-            )
-        except Exception as exc:
-            logger.debug("Error inspecting search result '%s': %s", query, exc)
-
-    return _hydrate_reddit_candidates(page, candidates)
-
-
-def _hydrate_reddit_candidates(page: Page, candidates: list[dict]) -> list[dict]:
-    """Fetch full post body for matched Reddit candidates and emit tagged leads."""
-    leads: list[dict] = []
-    for item in candidates:
-        selftext = _fetch_post_body(page, item["old_permalink"])
-        primary_niche = item["matched_niches"][0]
-        mark_post_processed(item["post_id"], primary_niche)
-
-        for niche_key in item["matched_niches"]:
-            cat = (
-                "agency_prospect"
-                if niche_key == "admin_growth" and item["category"] == "client_lead"
-                else item["category"]
-            )
-            logger.info(
-                "MATCHED LEAD [Reddit | %s | %s] %s: %s",
-                cat,
-                niche_key,
-                item["group_or_sub"],
-                item["title"],
-            )
-            leads.append(
-                {
-                    "post_id": item["post_id"],
-                    "niche": niche_key,
-                    "platform": "Reddit",
-                    "group_or_sub": item["group_or_sub"],
-                    "category": cat,
-                    "subreddit": item["subreddit"],
-                    "title": item["title"],
-                    "selftext": selftext[:2000],
-                    "url": item["permalink"],
-                }
-            )
     return leads
 
 
@@ -467,7 +319,7 @@ def _hydrate_reddit_candidates(page: Page, candidates: list[dict]) -> list[dict]
 def scrape_hackernews_api() -> list[dict]:
     """
     Fetch real-time stories & comments via hn.algolia.com/api/v1/search_by_date
-    for the last 24h using `requests` (no browser needed) and match niche keywords.
+    for the last 24h using `requests` (no browser needed), including author HN profile URL.
     """
     unix_24h_ago = int(time.time()) - 86_400
     leads: list[dict] = []
@@ -516,6 +368,8 @@ def scrape_hackernews_api() -> list[dict]:
         else:
             group_or_sub = "Hacker News"
 
+        author = (hit.get("author") or "").strip()
+        author_url = f"https://news.ycombinator.com/user?id={author}" if author else ""
         hn_url = f"https://news.ycombinator.com/item?id={object_id}"
         mark_post_processed(post_id, niche)
 
@@ -531,6 +385,8 @@ def scrape_hackernews_api() -> list[dict]:
                 "title": title,
                 "selftext": comment_text[:2000],
                 "url": hn_url,
+                "author": author,
+                "author_url": author_url,
             }
         )
 
@@ -538,11 +394,127 @@ def scrape_hackernews_api() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 3. Indie Hackers Harvester (Playwright + Asset Blocking)
+# 3. Product Hunt Public Feed Harvester (no 403)
+# ---------------------------------------------------------------------------
+
+def _fetch_producthunt_feed_items() -> tuple[list[dict], int | None, str | None]:
+    """
+    Fetch https://www.producthunt.com/feed via requests + XML parsing to capture
+    newly launched products, taglines, descriptions, and maker links without 403 blocks.
+    """
+    headers = {
+        "User-Agent": REDDIT_RSS_UA,
+        "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
+    }
+    try:
+        resp = requests.get(PRODUCTHUNT_FEED_URL, headers=headers, timeout=12)
+        status = resp.status_code
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as exc:
+        return [], getattr(locals().get("resp"), "status_code", None), str(exc)
+
+    items: list[dict] = []
+
+    # Atom format (<entry>)
+    entries = root.findall("atom:entry", _ATOM_NS)
+    if entries:
+        for entry in entries[:30]:
+            title = html.unescape(
+                (entry.findtext("atom:title", default="", namespaces=_ATOM_NS) or "").strip()
+            )
+            raw_body = (
+                entry.findtext("atom:content", default="", namespaces=_ATOM_NS)
+                or entry.findtext("atom:summary", default="", namespaces=_ATOM_NS)
+                or ""
+            )
+            body = " ".join(_strip_html(html.unescape(raw_body)).split())
+            link_el = entry.find("atom:link", _ATOM_NS)
+            url = (link_el.attrib.get("href", "") if link_el is not None else "").strip()
+            author = (
+                entry.findtext("atom:author/atom:name", default="", namespaces=_ATOM_NS) or ""
+            ).strip()
+            author_uri = (
+                entry.findtext("atom:author/atom:uri", default="", namespaces=_ATOM_NS) or ""
+            ).strip()
+            if title and url:
+                items.append(
+                    {
+                        "title": title,
+                        "body": body[:2000],
+                        "url": url,
+                        "author": author,
+                        "author_url": author_uri,
+                    }
+                )
+        return items, status, None
+
+    # RSS 2.0 fallback (<channel>/<item>)
+    for item in root.findall("./channel/item")[:30]:
+        title = html.unescape((item.findtext("title") or "").strip())
+        raw_body = item.findtext("description") or ""
+        body = " ".join(_strip_html(html.unescape(raw_body)).split())
+        url = (item.findtext("link") or "").strip()
+        author = (item.findtext("author") or "").strip()
+        if title and url:
+            items.append(
+                {
+                    "title": title,
+                    "body": body[:2000],
+                    "url": url,
+                    "author": author,
+                    "author_url": "",
+                }
+            )
+    return items, status, None
+
+
+def scrape_producthunt() -> list[dict]:
+    """Harvest Product Hunt launches/descriptions via the public XML feed."""
+    leads: list[dict] = []
+    items, status, err = _fetch_producthunt_feed_items()
+    if err:
+        logger.warning("Product Hunt feed error (%s): %s", status, err)
+        return []
+
+    logger.info("Product Hunt Feed -> HTTP %s | %d items", status, len(items))
+    for item in items:
+        post_id = "ph_" + hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:12]
+        if is_post_processed(post_id):
+            continue
+
+        combined = f"{item['title']} {item['body']}"
+        niche, category = _classify_text_to_niche(combined)
+        if not niche:
+            continue
+
+        mark_post_processed(post_id, niche)
+        logger.info("MATCHED LEAD [Product Hunt | %s]: %.80s", niche, item["title"])
+        leads.append(
+            {
+                "post_id": post_id,
+                "niche": niche,
+                "platform": "Product Hunt",
+                "group_or_sub": "Product Hunt",
+                "category": category,
+                "subreddit": "Product Hunt",
+                "title": item["title"],
+                "selftext": item["body"][:2000],
+                "url": item["url"],
+                "author": item.get("author", ""),
+                "author_url": item.get("author_url", ""),
+            }
+        )
+
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# 4. Indie Hackers Harvester (Playwright + Post Body & Author Hydration)
 # ---------------------------------------------------------------------------
 
 def scrape_indiehackers(page: Page) -> list[dict]:
-    """Scrape indiehackers.com/newest and /groups using Playwright with asset blocking."""
+    """Scrape indiehackers.com/newest & /groups, hydrating full post body & author profile."""
     leads: list[dict] = []
     targets = [
         (INDIEHACKERS_NEWEST_URL, "Indie Hackers"),
@@ -566,6 +538,8 @@ def scrape_indiehackers(page: Page) -> list[dict]:
             if not niche:
                 continue
 
+            body, author, author_url = _hydrate_indiehackers_post(page, item["url"], item["title"])
+            final_body = body or item["body"]
             mark_post_processed(post_id, niche)
             logger.info("MATCHED LEAD [Indie Hackers | %s]: %.80s", niche, item["title"])
             leads.append(
@@ -577,8 +551,10 @@ def scrape_indiehackers(page: Page) -> list[dict]:
                     "category": category,
                     "subreddit": group_label,
                     "title": item["title"],
-                    "selftext": item["body"][:2000],
+                    "selftext": final_body[:2000],
                     "url": item["url"],
+                    "author": author,
+                    "author_url": author_url,
                 }
             )
 
@@ -628,153 +604,38 @@ def _fetch_indiehackers_items(page: Page, url: str) -> tuple[list[dict], int | N
     return items, status, None
 
 
-# ---------------------------------------------------------------------------
-# 4. Product Hunt Harvester (Playwright + Asset Blocking)
-# ---------------------------------------------------------------------------
-
-def scrape_producthunt(page: Page) -> list[dict]:
-    """Scrape producthunt.com/discussions using Playwright with asset blocking."""
-    leads: list[dict] = []
-    items, status, err = _fetch_producthunt_items(page, PRODUCTHUNT_DISCUSSIONS_URL)
-    if err:
-        logger.warning("Product Hunt error: %s", err)
-        return []
-
-    logger.info("Product Hunt Discussions -> HTTP %s | %d items", status, len(items))
-    for item in items:
-        post_id = "ph_" + hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:12]
-        if is_post_processed(post_id):
-            continue
-
-        combined = f"{item['title']} {item['body']}"
-        niche, category = _classify_text_to_niche(combined)
-        if not niche:
-            continue
-
-        mark_post_processed(post_id, niche)
-        logger.info("MATCHED LEAD [Product Hunt | %s]: %.80s", niche, item["title"])
-        leads.append(
-            {
-                "post_id": post_id,
-                "niche": niche,
-                "platform": "Product Hunt",
-                "group_or_sub": "Product Hunt",
-                "category": category,
-                "subreddit": "Product Hunt",
-                "title": item["title"],
-                "selftext": item["body"][:2000],
-                "url": item["url"],
-            }
-        )
-
-    return leads
-
-
-def _fetch_producthunt_items(page: Page, url: str) -> tuple[list[dict], int | None, str | None]:
+def _hydrate_indiehackers_post(page: Page, post_url: str, title: str) -> tuple[str, str, str]:
     """
-    Navigate to Product Hunt discussions with the stealth context (waiting for
-    discussion selectors) and fall back to Product Hunt's GraphQL endpoint on 403/empty.
+    Visit an Indie Hackers post URL to extract the actual post body (excluding
+    repeated title/upvotes) and the author's profile URL (`indiehackers.com/{username}`).
     """
-    status: int | None = None
     try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        status = resp.status if resp else None
-        try:
-            page.wait_for_selector(
-                '[data-test="discussion-item"], a[href*="/discussions/"]',
-                timeout=4_000,
-            )
-        except PWTimeout:
-            pass
-        page.wait_for_timeout(1_500)
-    except PWTimeout:
-        return [], None, f"Timeout loading {url}"
-    except Exception as exc:
-        return [], None, str(exc)
-
-    seen_urls: set[str] = set()
-    items: list[dict] = []
-
-    selectors = page.query_selector_all('[data-test="discussion-item"]')
-    if not selectors:
-        selectors = page.query_selector_all('a[href*="/discussions/"]')
-
-    for node in selectors[:40]:
-        try:
-            link = node if (node.evaluate("el => el.tagName") == "A") else node.query_selector('a[href*="/discussions/"]')
-            if not link:
-                continue
-            href = link.get_attribute("href") or ""
-            if not href or href.rstrip("/") == "/discussions":
-                continue
-            full_url = href if href.startswith("http") else f"https://www.producthunt.com{href}"
-            full_url = full_url.split("#")[0].split("?")[0]
-            if full_url in seen_urls:
-                continue
-
-            title = (link.inner_text() or "").strip()
-            if len(title) < 8:
-                continue
-            seen_urls.add(full_url)
-
-            body = (
-                node.evaluate("el => el.closest('article, section, div')?.innerText || el.innerText || ''")
-                or ""
-            ).strip()[:1000]
-            items.append({"title": title, "body": body, "url": full_url})
-        except Exception:
-            continue
-
-    if items:
-        return items, status, None
-
-    # Fallback: Product Hunt GraphQL endpoint with stealth headers
-    gql_items, gql_status = _fetch_producthunt_graphql()
-    if gql_items:
-        return gql_items, gql_status, None
-    return [], status or gql_status, f"HTTP {status} (0 discussion items parsed)" if status and status >= 400 else None
-
-
-def _fetch_producthunt_graphql() -> tuple[list[dict], int | None]:
-    """Query Product Hunt's frontend GraphQL endpoint for recent discussions."""
-    query = """
-    query DiscussionsFeed {
-      discussions(first: 20) {
-        edges {
-          node {
-            id
-            title
-            body
-            url
-          }
-        }
-      }
-    }
-    """
-    headers = {
-        "User-Agent": STEALTH_USER_AGENT,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Origin": "https://www.producthunt.com",
-        "Referer": "https://www.producthunt.com/discussions",
-    }
-    try:
-        resp = requests.post(PH_GRAPHQL_URL, json={"query": query}, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return [], resp.status_code
-        edges = resp.json().get("data", {}).get("discussions", {}).get("edges", [])
-        items: list[dict] = []
-        for edge in edges:
-            node = (edge or {}).get("node") or {}
-            title = (node.get("title") or "").strip()
-            body = (node.get("body") or "").strip()
-            url = (node.get("url") or "").strip()
-            if title and url:
-                items.append({"title": title, "body": body[:1000], "url": url})
-        return items, resp.status_code
+        page.goto(post_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        page.wait_for_timeout(SETTLE_WAIT_MS)
     except Exception:
-        return [], None
+        return "", "", ""
+
+    body = ""
+    for sel in (".post-page__body", ".content", "article .body", "main p"):
+        els = page.query_selector_all(sel)
+        if els:
+            joined = " ".join((e.inner_text() or "").strip() for e in els[:6]).strip()
+            if len(joined) > 25 and joined.lower() != title.lower():
+                body = joined
+                break
+
+    author = ""
+    author_url = ""
+    for a in page.query_selector_all('a[href^="/"]')[:30]:
+        href = (a.get_attribute("href") or "").strip()
+        if re.fullmatch(r"/[A-Za-z0-9_.-]{2,32}", href):
+            slug = href.lstrip("/")
+            if slug.lower() not in _IH_RESERVED_SLUGS:
+                author = slug
+                author_url = f"https://www.indiehackers.com/{slug}"
+                break
+
+    return body[:2000], author, author_url
 
 
 # ---------------------------------------------------------------------------
@@ -817,11 +678,30 @@ def _inject_x_cookies(context: BrowserContext, auth_token: str, ct0: str) -> Non
     context.add_cookies(cookies)
 
 
+def _warm_x_session(page: Page) -> tuple[int | None, str | None]:
+    """
+    Load https://x.com/home first after setting auth_token/ct0 so X sets session
+    cookies (`twid`/`guest_id`) before navigating to search/communities.
+    """
+    try:
+        resp = page.goto(X_HOME_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        status = resp.status if resp else None
+        page.wait_for_timeout(2_000)
+        if status == 403:
+            return status, "X blocked datacenter IP — requires residential proxy or fresh cookies"
+        if "/login" in page.url or "/i/flow/login" in page.url:
+            return status, "X blocked datacenter IP — requires residential proxy or fresh cookies"
+        return status, None
+    except PWTimeout:
+        return None, "Timeout loading x.com/home"
+    except Exception as exc:
+        return None, str(exc)
+
+
 def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
     """
-    Inject X_AUTH_TOKEN / X_CT0 cookies if present, scan live X search queries
-    and the user's joined X Communities feed (`x.com/i/communities`).
-    Gracefully skips if unset or cookies expired.
+    Inject X_AUTH_TOKEN / X_CT0 cookies, warm session on x.com/home, then scan
+    live X search queries and joined X Communities (`x.com/i/communities`).
     """
     auth_token, ct0 = _get_x_credentials()
     if not auth_token or not ct0:
@@ -829,13 +709,18 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
         return []
 
     _inject_x_cookies(context, auth_token, ct0)
+    _, warm_err = _warm_x_session(page)
+    if warm_err:
+        logger.warning(warm_err)
+        return []
+
     leads: list[dict] = []
 
     # 5a. Joined X Communities timeline
     comm_items, status, err = _fetch_x_tweets(page, X_COMMUNITIES_URL)
     if err:
         logger.warning("X Communities skipped: %s", err)
-        if "login" in err.lower() or "expired" in err.lower():
+        if "blocked" in err.lower() or "expired" in err.lower():
             return []
     else:
         logger.info("X Communities -> HTTP %s | %d tweets", status, len(comm_items))
@@ -861,6 +746,8 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
                     "title": tw["text"][:140],
                     "selftext": tw["text"][:2000],
                     "url": tw["url"],
+                    "author": tw.get("author", ""),
+                    "author_url": tw.get("author_url", ""),
                 }
             )
 
@@ -870,7 +757,7 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
         tweets, status, err = _fetch_x_tweets(page, search_url)
         if err:
             logger.warning("X Search (%s) skipped: %s", entry["niche"], err)
-            if "login" in err.lower() or "expired" in err.lower():
+            if "blocked" in err.lower() or "expired" in err.lower():
                 break
             continue
 
@@ -897,6 +784,8 @@ def scrape_x_global(context: BrowserContext, page: Page) -> list[dict]:
                     "title": tw["text"][:140],
                     "selftext": tw["text"][:2000],
                     "url": tw["url"],
+                    "author": tw.get("author", ""),
+                    "author_url": tw.get("author_url", ""),
                 }
             )
 
@@ -908,6 +797,8 @@ def _fetch_x_tweets(page: Page, url: str) -> tuple[list[dict], int | None, str |
     try:
         resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         status = resp.status if resp else None
+        if status == 403:
+            return [], status, "X blocked datacenter IP — requires residential proxy or fresh cookies"
         try:
             page.wait_for_selector('article[data-testid="tweet"]', timeout=3_000)
         except PWTimeout:
@@ -919,13 +810,13 @@ def _fetch_x_tweets(page: Page, url: str) -> tuple[list[dict], int | None, str |
         return [], None, str(exc)
 
     if "/login" in page.url or "/i/flow/login" in page.url:
-        return [], status, "X cookies expired or redirected to login"
+        return [], status, "X blocked datacenter IP — requires residential proxy or fresh cookies"
 
     articles = page.query_selector_all('article[data-testid="tweet"]')
     if not articles:
         login_input = page.query_selector('input[name="text"]')
         if login_input:
-            return [], status, "X cookies expired (login prompt shown)"
+            return [], status, "X blocked datacenter IP — requires residential proxy or fresh cookies"
         return [], status, None
 
     tweets: list[dict] = []
@@ -947,7 +838,11 @@ def _fetch_x_tweets(page: Page, url: str) -> tuple[list[dict], int | None, str |
                 continue
             seen_urls.add(tweet_url)
 
-            tweets.append({"text": text, "url": tweet_url})
+            handle_match = re.search(r"x\.com/([^/]+)/status/", tweet_url)
+            author = handle_match.group(1) if handle_match else ""
+            author_url = f"https://x.com/{author}" if author else ""
+
+            tweets.append({"text": text, "url": tweet_url, "author": author, "author_url": author_url})
         except Exception:
             continue
 
@@ -973,40 +868,8 @@ def _classify_text_to_niche(text: str) -> tuple[str | None, str]:
 
 
 def _strip_html(raw: str) -> str:
-    """Remove basic HTML tags from Hacker News Algolia snippets."""
+    """Remove HTML tags from RSS/HN snippets."""
     return re.sub(r"<[^>]+>", " ", raw).strip()
-
-
-def _extract_post_id(url: str) -> str:
-    match = _COMMENT_ID_RE.search(url)
-    return f"t3_{match.group(1)}" if match else ""
-
-
-def _extract_subreddit(url: str) -> str:
-    match = _SUBREDDIT_RE.search(url)
-    return match.group(1) if match else ""
-
-
-def _normalise_old_reddit_url(raw_href: str) -> str:
-    if raw_href.startswith("/r/"):
-        return OLD_REDDIT_BASE + raw_href
-    if raw_href.startswith("https://www.reddit.com"):
-        return raw_href.replace("https://www.reddit.com", OLD_REDDIT_BASE, 1)
-    return raw_href
-
-
-def _fetch_post_body(page: Page, old_reddit_url: str) -> str:
-    if not old_reddit_url.startswith("http"):
-        return ""
-    try:
-        page.goto(old_reddit_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        page.wait_for_timeout(1_000)
-        body_el = page.query_selector("div.expando div.usertext-body")
-        if body_el:
-            return (body_el.inner_text() or "").strip()
-    except Exception as exc:
-        logger.debug("Could not fetch post body from %s: %s", old_reddit_url, exc)
-    return ""
 
 
 def _matches_keywords(text: str, keywords: list[str]) -> bool:
@@ -1018,68 +881,60 @@ def _matches_keywords(text: str, keywords: list[str]) -> bool:
 # Live Diagnostic Test Scrape (/test_scrape — All 5 Platforms)
 # ---------------------------------------------------------------------------
 
-def _build_fallback_outreach(post: dict, matched_kw: str) -> tuple[str, str]:
-    """Return (suggested_comment, suggested_dm) for test cards when Gemini isn't used."""
-    title = (post.get("title") or "your post").strip()[:80]
-    kw = matched_kw or "this"
-    comment = (
-        f"Great question on {kw}! A quick win here is auditing the current funnel/setup first "
-        f"so you don't waste budget on low-converting traffic. Happy to share a quick breakdown "
-        f"or checklist if that helps."
-    )
-    dm = (
-        f"Hey! Saw your post about \"{title}\" — I've helped similar teams solve {kw} "
-        f"without the usual agency fluff. Happy to send over a 2-minute teardown of what I'd fix first, "
-        f"no strings attached."
-    )
-    return comment, dm
-
-
-def _enrich_test_match(match: dict, niche: str) -> dict:
-    """Attach description snippet + suggested_comment + custom_dm to a /test_scrape match."""
+def _enrich_test_match(match: dict, niche: str) -> dict | None:
+    """
+    Attach description snippet and Gemini-generated friendly public comment + DM
+    to a `/test_scrape` match. Never falls back to hardcoded generic templates.
+    Filters out posts that Gemini explicitly rejects (`is_buyer=False`) when Gemini is active.
+    """
     desc = " ".join((match.get("selftext") or match.get("title") or "").split())
-    if len(desc) > 360:
-        desc = desc[:357].rstrip() + "..."
+    if len(desc) > 400:
+        desc = desc[:397].rstrip() + "..."
     match["description"] = desc or "(no description)"
+    match["suggested_comment"] = ""
+    match["custom_dm"] = ""
 
-    comment, dm = _build_fallback_outreach(match, match.get("matched_keyword", ""))
+    if not GEMINI_API_KEY:
+        return match
+
     try:
-        from config import GEMINI_API_KEY
-        if GEMINI_API_KEY:
-            from ai_filter import qualify_lead
-            q = qualify_lead(
-                {
-                    "platform": match.get("platform", "Reddit"),
-                    "group_or_sub": match.get("group_or_sub", ""),
-                    "niche": niche,
-                    "category": "client_lead",
-                    "title": match.get("title", ""),
-                    "selftext": match.get("selftext", ""),
-                }
-            )
-            if q:
-                comment = q.get("suggested_comment") or comment
-                dm = q.get("custom_dm") or dm
-    except Exception as exc:
-        logger.debug("Test match Gemini enrichment skipped: %s", exc)
+        from ai_filter import qualify_lead
 
-    match["suggested_comment"] = comment
-    match["custom_dm"] = dm
+        q = qualify_lead(
+            {
+                "platform": match.get("platform", "Reddit"),
+                "group_or_sub": match.get("group_or_sub", ""),
+                "niche": niche,
+                "category": "client_lead",
+                "author": match.get("author", ""),
+                "title": match.get("title", ""),
+                "selftext": match.get("selftext", ""),
+            }
+        )
+        if q:
+            if not q.get("is_buyer"):
+                return None
+            match["intent_score"] = q.get("intent_score", 0)
+            match["suggested_comment"] = q.get("suggested_comment", "")
+            match["custom_dm"] = q.get("custom_dm", "")
+    except Exception as exc:
+        logger.debug("Test match Gemini enrichment failed: %s", exc)
+
     return match
 
 
 def run_test_scrape(niche: str = "seo_mkt") -> dict:
     """
-    Test all 5 platforms (Reddit, Hacker News, Indie Hackers, Product Hunt, X)
+    Test all 5 platforms (Reddit RSS, Hacker News, Product Hunt Feed, Indie Hackers, X)
     in one quick cycle without mutating `leads.db`. Returns per-platform status,
-    posts scanned, keyword matches found, and enriched top sample matches.
+    posts scanned, keyword matches found, and Gemini-enriched top matches.
     """
     cfg = NICHES.get(niche) or NICHES.get("seo_mkt", {})
     keywords = cfg.get("keywords", ["seo", "marketing"])
     subreddits = (cfg.get("subreddits") or ["SEO", "marketing"])[:2]
 
     platform_reports: list[dict] = []
-    matches: list[dict] = []
+    raw_matches: list[dict] = []
     total_scanned = 0
 
     try:
@@ -1097,7 +952,7 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     "numericFilters": f"created_at_i>{unix_24h_ago}",
                     "hitsPerPage": 50,
                 },
-                headers={"User-Agent": STEALTH_USER_AGENT},
+                headers={"User-Agent": USER_AGENT},
                 timeout=10,
             )
             hn_status = resp.status_code
@@ -1113,15 +968,18 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                 if matched_kw:
                     hn_matches += 1
                     obj_id = hit.get("objectID", "")
+                    author = (hit.get("author") or "").strip()
                     tags = hit.get("_tags") or []
                     group = "Ask HN" if "ask_hn" in tags else "Hacker News"
-                    matches.append(
+                    raw_matches.append(
                         {
                             "platform": "Hacker News",
                             "group_or_sub": group,
                             "title": title or body[:120],
                             "selftext": body or title,
                             "url": f"https://news.ycombinator.com/item?id={obj_id}",
+                            "author": author,
+                            "author_url": f"https://news.ycombinator.com/user?id={author}" if author else "",
                             "matched_keyword": matched_kw,
                         }
                     )
@@ -1139,57 +997,90 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
             }
         )
 
-        # 2-5. Playwright platforms with stealth context, asset blocking & 15s timeout
+        # 2. Reddit RSS (requests, no browser, no login wall)
+        rd_status: int | None = None
+        rd_scanned = 0
+        rd_matches = 0
+        rd_err: str | None = None
+        for sub in subreddits:
+            posts, sub_status, sub_err = _fetch_reddit_rss_posts(sub)
+            if sub_status:
+                rd_status = sub_status
+            if sub_err and not posts:
+                rd_err = sub_err
+                continue
+            rd_scanned += len(posts)
+            total_scanned += len(posts)
+            for item in posts:
+                combined = f"{item['title']} {item['selftext']}".lower()
+                matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
+                if matched_kw:
+                    rd_matches += 1
+                    raw_matches.append(
+                        {
+                            "platform": "Reddit",
+                            "group_or_sub": f"r/{sub}",
+                            "title": item["title"],
+                            "selftext": item["selftext"] or item["title"],
+                            "url": item["url"],
+                            "author": item["author"],
+                            "author_url": item["author_url"],
+                            "matched_keyword": matched_kw,
+                        }
+                    )
+
+        platform_reports.append(
+            {
+                "platform": "Reddit",
+                "badge": f"🟠 Reddit ({', '.join('r/' + s for s in subreddits)})",
+                "status": rd_status,
+                "posts_scanned": rd_scanned,
+                "matches_found": rd_matches,
+                "error": rd_err,
+            }
+        )
+
+        # 3. Product Hunt Feed (requests, no 403)
+        ph_items, ph_status, ph_err = _fetch_producthunt_feed_items()
+        ph_scanned = len(ph_items)
+        total_scanned += ph_scanned
+        ph_matches = 0
+        for item in ph_items:
+            combined = f"{item['title']} {item['body']}".lower()
+            matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
+            if matched_kw:
+                ph_matches += 1
+                raw_matches.append(
+                    {
+                        "platform": "Product Hunt",
+                        "group_or_sub": "Product Hunt",
+                        "title": item["title"],
+                        "selftext": item["body"] or item["title"],
+                        "url": item["url"],
+                        "author": item.get("author", ""),
+                        "author_url": item.get("author_url", ""),
+                        "matched_keyword": matched_kw,
+                    }
+                )
+        platform_reports.append(
+            {
+                "platform": "Product Hunt",
+                "badge": "🚀 Product Hunt",
+                "status": ph_status,
+                "posts_scanned": ph_scanned,
+                "matches_found": ph_matches,
+                "error": ph_err,
+            }
+        )
+
+        # 4 & 5. Playwright platforms (Indie Hackers & X)
         with sync_playwright() as pw:
             browser: Browser = _launch_browser(pw)
             try:
                 context = _new_stealth_context(browser)
                 page: Page = _new_fast_page(context)
 
-                # 2. Reddit (old.reddit.com/r/{sub}/new.json + HTML fallback)
-                rd_status: int | None = None
-                rd_scanned = 0
-                rd_matches = 0
-                rd_err: str | None = None
-                for sub in subreddits:
-                    posts, sub_status, sub_err = _fetch_reddit_subreddit_posts(page, sub)
-                    if sub_status:
-                        rd_status = sub_status
-                    if sub_err and not posts:
-                        rd_err = sub_err
-                        continue
-                    rd_scanned += len(posts)
-                    total_scanned += len(posts)
-                    for item in posts:
-                        combined = f"{item['title']} {item['selftext']}".lower()
-                        matched_kw = next(
-                            (kw for kw in keywords if kw.lower() in combined), None
-                        )
-                        if matched_kw:
-                            rd_matches += 1
-                            matches.append(
-                                {
-                                    "platform": "Reddit",
-                                    "group_or_sub": f"r/{sub}",
-                                    "title": item["title"],
-                                    "selftext": item["selftext"] or item["title"],
-                                    "url": item["url"],
-                                    "matched_keyword": matched_kw,
-                                }
-                            )
-
-                platform_reports.append(
-                    {
-                        "platform": "Reddit",
-                        "badge": f"🟠 Reddit ({', '.join('r/' + s for s in subreddits)})",
-                        "status": rd_status,
-                        "posts_scanned": rd_scanned,
-                        "matches_found": rd_matches,
-                        "error": rd_err,
-                    }
-                )
-
-                # 3. Indie Hackers
+                # 4. Indie Hackers (+ hydrate post body & author profile for matched posts)
                 ih_items, ih_status, ih_err = _fetch_indiehackers_items(page, INDIEHACKERS_NEWEST_URL)
                 ih_scanned = len(ih_items)
                 total_scanned += ih_scanned
@@ -1199,13 +1090,18 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
                     if matched_kw:
                         ih_matches += 1
-                        matches.append(
+                        body, author, author_url = _hydrate_indiehackers_post(
+                            page, item["url"], item["title"]
+                        )
+                        raw_matches.append(
                             {
                                 "platform": "Indie Hackers",
                                 "group_or_sub": "Indie Hackers",
                                 "title": item["title"],
-                                "selftext": item["body"] or item["title"],
+                                "selftext": body or item["body"] or item["title"],
                                 "url": item["url"],
+                                "author": author,
+                                "author_url": author_url,
                                 "matched_keyword": matched_kw,
                             }
                         )
@@ -1220,40 +1116,7 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     }
                 )
 
-                # 4. Product Hunt
-                ph_items, ph_status, ph_err = _fetch_producthunt_items(
-                    page, PRODUCTHUNT_DISCUSSIONS_URL
-                )
-                ph_scanned = len(ph_items)
-                total_scanned += ph_scanned
-                ph_matches = 0
-                for item in ph_items:
-                    combined = f"{item['title']} {item['body']}".lower()
-                    matched_kw = next((kw for kw in keywords if kw.lower() in combined), None)
-                    if matched_kw:
-                        ph_matches += 1
-                        matches.append(
-                            {
-                                "platform": "Product Hunt",
-                                "group_or_sub": "Product Hunt",
-                                "title": item["title"],
-                                "selftext": item["body"] or item["title"],
-                                "url": item["url"],
-                                "matched_keyword": matched_kw,
-                            }
-                        )
-                platform_reports.append(
-                    {
-                        "platform": "Product Hunt",
-                        "badge": "🚀 Product Hunt",
-                        "status": ph_status,
-                        "posts_scanned": ph_scanned,
-                        "matches_found": ph_matches,
-                        "error": ph_err,
-                    }
-                )
-
-                # 5. X / Twitter & Joined Communities
+                # 5. X / Twitter & Joined Communities (x.com/home warm-up first)
                 auth_token, ct0 = _get_x_credentials()
                 if not auth_token or not ct0:
                     platform_reports.append(
@@ -1268,55 +1131,77 @@ def run_test_scrape(niche: str = "seo_mkt") -> dict:
                     )
                 else:
                     _inject_x_cookies(context, auth_token, ct0)
-                    q_entry = next(
-                        (q for q in X_SEARCH_QUERIES if q["niche"] == niche),
-                        X_SEARCH_QUERIES[0],
-                    )
-                    x_items, x_status, x_err = _fetch_x_tweets(
-                        page, X_SEARCH_URL.format(query=quote_plus(q_entry["query"]))
-                    )
-                    c_items, c_status, c_err = _fetch_x_tweets(page, X_COMMUNITIES_URL)
-                    all_x = [("X Search", t) for t in x_items] + [("X Community", t) for t in c_items]
-                    x_scanned = len(all_x)
-                    total_scanned += x_scanned
-                    x_matches = 0
-                    for grp, tw in all_x:
-                        matched_kw = next(
-                            (kw for kw in keywords if kw.lower() in tw["text"].lower()), None
+                    warm_status, warm_err = _warm_x_session(page)
+                    if warm_err:
+                        platform_reports.append(
+                            {
+                                "platform": "X",
+                                "badge": "𝕏 X / Community",
+                                "status": warm_status or "Blocked",
+                                "posts_scanned": 0,
+                                "matches_found": 0,
+                                "error": warm_err,
+                            }
                         )
-                        if matched_kw:
-                            x_matches += 1
-                            matches.append(
-                                {
-                                    "platform": "X",
-                                    "group_or_sub": grp,
-                                    "title": tw["text"][:140],
-                                    "selftext": tw["text"],
-                                    "url": tw["url"],
-                                    "matched_keyword": matched_kw,
-                                }
+                    else:
+                        q_entry = next(
+                            (q for q in X_SEARCH_QUERIES if q["niche"] == niche),
+                            X_SEARCH_QUERIES[0],
+                        )
+                        x_items, x_status, x_err = _fetch_x_tweets(
+                            page, X_SEARCH_URL.format(query=quote_plus(q_entry["query"]))
+                        )
+                        c_items, c_status, c_err = _fetch_x_tweets(page, X_COMMUNITIES_URL)
+                        all_x = [("X Search", t) for t in x_items] + [("X Community", t) for t in c_items]
+                        x_scanned = len(all_x)
+                        total_scanned += x_scanned
+                        x_matches = 0
+                        for grp, tw in all_x:
+                            matched_kw = next(
+                                (kw for kw in keywords if kw.lower() in tw["text"].lower()), None
                             )
-                    platform_reports.append(
-                        {
-                            "platform": "X",
-                            "badge": "𝕏 X / Community",
-                            "status": x_status or c_status,
-                            "posts_scanned": x_scanned,
-                            "matches_found": x_matches,
-                            "error": x_err or c_err,
-                        }
-                    )
+                            if matched_kw:
+                                x_matches += 1
+                                raw_matches.append(
+                                    {
+                                        "platform": "X",
+                                        "group_or_sub": grp,
+                                        "title": tw["text"][:140],
+                                        "selftext": tw["text"],
+                                        "url": tw["url"],
+                                        "author": tw.get("author", ""),
+                                        "author_url": tw.get("author_url", ""),
+                                        "matched_keyword": matched_kw,
+                                    }
+                                )
+                        platform_reports.append(
+                            {
+                                "platform": "X",
+                                "badge": "𝕏 X / Community",
+                                "status": x_status or c_status,
+                                "posts_scanned": x_scanned,
+                                "matches_found": x_matches,
+                                "error": x_err or c_err,
+                            }
+                        )
             finally:
                 browser.close()
 
-        top_matches = [_enrich_test_match(m, niche) for m in matches[:3]]
+        qualified_matches: list[dict] = []
+        for m in raw_matches[:8]:
+            enriched = _enrich_test_match(m, niche)
+            if enriched is not None:
+                qualified_matches.append(enriched)
+            if len(qualified_matches) >= 3:
+                break
+
         return {
             "niche": niche,
             "keywords": keywords,
             "details": platform_reports,
             "total_scanned": total_scanned,
-            "matches": top_matches,
-            "total_matches": len(matches),
+            "matches": qualified_matches,
+            "total_matches": len(raw_matches),
             "error": None,
         }
     except Exception as exc:

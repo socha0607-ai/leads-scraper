@@ -323,15 +323,34 @@ def handle_test_scrape(message: types.Message) -> None:
             for idx, m in enumerate(res["matches"][:3], start=1):
                 badge = _format_platform_badge(m)
                 url = _escape_html(m.get("url", ""))
+                author_url = (m.get("author_url") or "").strip()
+                author_label = _escape_html(m.get("author") or author_url)
+                author_line = (
+                    f"👤 <b>Author Profile:</b> <a href=\"{_escape_html(author_url)}\">{author_label}</a>\n"
+                    if author_url
+                    else ""
+                )
+                score_str = f" | ⚡ <b>Intent:</b> {m['intent_score']}/10" if m.get("intent_score") else ""
+                comment_block = (
+                    f"<pre>{_escape_html(m['suggested_comment'])}</pre>"
+                    if m.get("suggested_comment")
+                    else "<i>(AI reply unavailable — check GEMINI_API_KEY)</i>"
+                )
+                dm_block = (
+                    f"<pre>{_escape_html(m['custom_dm'])}</pre>"
+                    if m.get("custom_dm")
+                    else "<i>(AI DM unavailable — check GEMINI_API_KEY)</i>"
+                )
                 card = (
-                    f"<b>#{idx} Match</b> (keyword: <code>{_escape_html(m['matched_keyword'])}</code>)\n"
+                    f"<b>#{idx} Match</b> (keyword: <code>{_escape_html(m['matched_keyword'])}</code>{score_str})\n"
                     f"{badge}\n\n"
                     f"📝 <b>Title:</b> {_escape_html(m.get('title', ''))}\n"
-                    f"📄 <b>Description:</b> {_escape_html(m.get('description', '(no description)'))}\n\n"
-                    f"💬 <b>Suggested Public Comment:</b>\n"
-                    f"<pre>{_escape_html(m.get('suggested_comment', ''))}</pre>\n\n"
-                    f"✉️ <b>Suggested Direct Message (DM):</b>\n"
-                    f"<pre>{_escape_html(m.get('custom_dm', ''))}</pre>\n\n"
+                    f"📄 <b>Description:</b> {_escape_html(m.get('description', '(no description)'))}\n"
+                    f"{author_line}\n"
+                    f"💬 <b>Friendly Public Comment:</b>\n"
+                    f"{comment_block}\n\n"
+                    f"✉️ <b>Natural Direct Message (DM):</b>\n"
+                    f"{dm_block}\n\n"
                     f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>"
                 )
                 bot.send_message(chat_id, card[:4090], disable_web_page_preview=True)
