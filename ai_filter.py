@@ -1,16 +1,6 @@
 """
-ai_filter.py — Gemini 2.5 Flash qualification & pitch generator with sample lead proof.
-
-Supports three categories:
-  1. `client_lead`:
-     Qualifies real B2B buyers and drafts a helpful 3-sentence outreach DM.
-  2. `agency_prospect`:
-     Qualifies agency owners / freelancers needing clients, embeds 1-2 live
-     verified `client_lead` URLs from `leads.db` as proof of value, and invites
-     them to a 5-day free trial on `https://t.me/<bot_username>`.
-  3. `distributor_prospect`:
-     Qualifies potential B2B SaaS affiliates / growth consultants / partners and
-     drafts a 30% recurring lifetime commission ($24/mo per active user) pitch.
+ai_filter.py — Gemini qualification & pitch generator with automatic model fallback
+and rule-based buyer-intent safety net.
 """
 
 import json
@@ -20,13 +10,31 @@ from typing import TypedDict
 from google import genai
 from google.genai import types
 
-from config import BOT_USERNAME, GEMINI_API_KEY, NICHE_LABELS
+from config import BOT_USERNAME, GEMINI_API_KEY, GEMINI_MODEL, NICHE_LABELS
 from database import get_latest_client_lead_urls
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL = "gemini-2.5-flash"
+_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+MODEL = GEMINI_MODEL
+_FALLBACK_MODELS: list[str] = [
+    "gemini-3.8-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+]
+_ACTIVE_MODEL: str | None = None
+
+_BUYER_INTENT_PHRASES: tuple[str, ...] = (
+    "looking for",
+    "need",
+    "hire",
+    "recommend",
+    "help with",
+    "agency",
+    "freelancer",
+    "how do i",
+    "struggling",
+)
 
 
 class QualificationResult(TypedDict):
@@ -111,8 +119,110 @@ _DISTRIBUTOR_SYSTEM_PROMPT = (
 )
 
 
-def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult | None:
-    """Qualify *post* via Gemini 2.5 Flash based on its category and niche."""
+def _candidate_models() -> list[str]:
+    """Return deduplicated list of Gemini models starting with active/configured model."""
+    ordered = ([_ACTIVE_MODEL] if _ACTIVE_MODEL else []) + [MODEL] + _FALLBACK_MODELS
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in ordered:
+        if m and m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return "404" in msg or "NOT_FOUND" in msg or "NOT FOUND" in msg
+
+
+def _discover_flash_model(exclude: set[str]) -> str | None:
+    """Dynamically pick an available `generateContent` flash model via models.list()."""
+    if not _client:
+        return None
+    try:
+        for m in _client.models.list():
+            name = (getattr(m, "name", "") or "").removeprefix("models/")
+            actions = getattr(m, "supported_actions", None) or []
+            if (
+                name
+                and name not in exclude
+                and "flash" in name.lower()
+                and (not actions or "generateContent" in actions)
+            ):
+                logger.info("Discovered available Gemini flash model: %s", name)
+                return name
+    except Exception as exc:
+        logger.debug("Could not list Gemini models: %s", exc)
+    return None
+
+
+def _rule_based_fallback(post: dict) -> QualificationResult:
+    """
+    Safety net when Gemini API fails (404, 429, timeout, or missing key):
+    never silently drop candidates; check buyer-intent phrases and assign 7/10.
+    """
+    title = (post.get("title") or "").strip()
+    body = (post.get("selftext") or post.get("body") or "").strip()
+    combined = f"{title} {body}".lower()
+    matched = next((p for p in _BUYER_INTENT_PHRASES if p in combined), None)
+
+    if not matched:
+        return {
+            "is_buyer": False,
+            "intent_score": 1,
+            "summary": "No clear buyer-intent phrase matched (rule-based fallback).",
+            "suggested_comment": "",
+            "custom_dm": "",
+        }
+
+    short_title = title[:90] if title else "your post"
+    return {
+        "is_buyer": True,
+        "intent_score": 7,
+        "summary": f"Matched buyer-intent phrase '{matched}' in: {short_title}",
+        "suggested_comment": (
+            f"Saw your post about \"{short_title}\" — happy to share a quick breakdown of what "
+            f"usually moves the needle first here so you don't waste time or budget. Feel free to "
+            f"share a bit more about your current setup if you'd like a second pair of eyes."
+        ),
+        "custom_dm": (
+            f"Hey! Saw your post on \"{short_title}\" and wanted to reach out with a quick tip "
+            f"on tackling the first bottleneck. Happy to send over a 2-minute teardown if helpful!"
+        ),
+    }
+
+
+def _call_gemini(model_name: str, system_prompt: str, prompt: str) -> QualificationResult:
+    assert _client is not None
+    response = _client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=_RESPONSE_SCHEMA,
+            temperature=0.2,
+        ),
+    )
+    raw_text = response.text.strip()
+    result: QualificationResult = json.loads(raw_text)
+    if not isinstance(result.get("is_buyer"), bool):
+        raise ValueError("is_buyer must be a boolean")
+    if not (1 <= int(result.get("intent_score", 0)) <= 10):
+        raise ValueError("intent_score out of range")
+    return result
+
+
+def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult:
+    """
+    Qualify *post* via Gemini with automatic model fallback (`gemini-3.8-flash` ->
+    `gemini-2.5-pro` -> `gemini-2.0-flash` -> dynamic `models.list()`).
+    Falls back to rule-based buyer-intent scoring (7/10) on API errors so leads
+    are never silently dropped.
+    """
+    global _ACTIVE_MODEL
+
     resolved_bot = (BOT_USERNAME or bot_username or "Lead_Scraper01_bot").lstrip("@")
     category = post.get("category", "client_lead")
     niche = post.get("niche", "web_dev")
@@ -121,7 +231,11 @@ def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult | No
         system_prompt = _DISTRIBUTOR_SYSTEM_PROMPT.format(bot_username=resolved_bot)
     elif category == "agency_prospect" or niche == "admin_growth":
         sample_urls = get_latest_client_lead_urls(limit=3)
-        sample_str = ", ".join(sample_urls) if sample_urls else "(no cached sample URLs yet — focus on real-time Reddit/HN buyer alerts)"
+        sample_str = (
+            ", ".join(sample_urls)
+            if sample_urls
+            else "(no cached sample URLs yet — focus on real-time Reddit/HN buyer alerts)"
+        )
         system_prompt = _AGENCY_PROSPECT_SYSTEM_PROMPT.format(
             bot_username=resolved_bot,
             sample_urls=sample_str,
@@ -130,44 +244,62 @@ def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult | No
         niche_label = NICHE_LABELS.get(niche, niche)
         system_prompt = _CLIENT_SYSTEM_PROMPT.format(niche_label=niche_label)
 
+    if not _client:
+        logger.warning("GEMINI_API_KEY not set — using rule-based fallback for %s", post.get("post_id"))
+        return _rule_based_fallback(post)
+
     prompt = _build_prompt(post)
+    tried: set[str] = set()
+    last_err: Exception | None = None
 
-    try:
-        response = _client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=_RESPONSE_SCHEMA,
-                temperature=0.2,
-            ),
-        )
+    for model_name in _candidate_models():
+        tried.add(model_name)
+        try:
+            result = _call_gemini(model_name, system_prompt, prompt)
+            _ACTIVE_MODEL = model_name
+            logger.info(
+                "Qualified [%s | %s | %s] %s → is_buyer=%s, score=%s",
+                post.get("platform", "Reddit"),
+                category,
+                model_name,
+                post.get("post_id"),
+                result["is_buyer"],
+                result["intent_score"],
+            )
+            return result
+        except Exception as err:
+            last_err = err
+            if _is_not_found_error(err):
+                logger.warning("Gemini model '%s' returned 404/NOT_FOUND — trying next fallback.", model_name)
+                continue
+            logger.warning("Gemini error on '%s' for %s: %s", model_name, post.get("post_id"), err)
+            break
 
-        raw_text = response.text.strip()
-        result: QualificationResult = json.loads(raw_text)
+    if last_err and _is_not_found_error(last_err):
+        discovered = _discover_flash_model(tried)
+        if discovered:
+            try:
+                result = _call_gemini(discovered, system_prompt, prompt)
+                _ACTIVE_MODEL = discovered
+                logger.info(
+                    "Qualified [%s | %s | %s] %s → is_buyer=%s, score=%s",
+                    post.get("platform", "Reddit"),
+                    category,
+                    discovered,
+                    post.get("post_id"),
+                    result["is_buyer"],
+                    result["intent_score"],
+                )
+                return result
+            except Exception as err:
+                logger.warning("Discovered model '%s' failed for %s: %s", discovered, post.get("post_id"), err)
 
-        if not isinstance(result.get("is_buyer"), bool):
-            raise ValueError("is_buyer must be a boolean")
-        if not (1 <= int(result.get("intent_score", 0)) <= 10):
-            raise ValueError("intent_score out of range")
-
-        logger.info(
-            "Qualified [%s | %s] %s → is_buyer=%s, score=%s",
-            post.get("platform", "Reddit"),
-            category,
-            post.get("post_id"),
-            result["is_buyer"],
-            result["intent_score"],
-        )
-        return result
-
-    except (json.JSONDecodeError, ValueError, KeyError) as parse_err:
-        logger.error("Failed to parse Gemini response for %s: %s", post.get("post_id"), parse_err)
-        return None
-    except Exception as api_err:
-        logger.error("Gemini API error for %s: %s", post.get("post_id"), api_err)
-        return None
+    logger.warning(
+        "Gemini unavailable for %s (%s) — using rule-based buyer-intent fallback.",
+        post.get("post_id"),
+        last_err,
+    )
+    return _rule_based_fallback(post)
 
 
 def _build_prompt(post: dict) -> str:
