@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.db-shm
+*.db-wal
+venv/
+.git/
+promo-video/
+*.md
+demo_promo.html
