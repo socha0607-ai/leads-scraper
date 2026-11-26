@@ -17,11 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from config import CHECK_INTERVAL_MINUTES, MIN_INTENT_SCORE  # noqa: E402
+from config import CHECK_INTERVAL_SECONDS, MIN_INTENT_SCORE  # noqa: E402
 from database import init_db, save_verified_client_lead
 from bot_handler import get_bot_username, start_polling
 from scraper import scrape_all_platforms
-from ai_filter import qualify_lead
+from ai_filter import qualify_leads_batch
 from notifier import send_lead_alert
 
 
@@ -63,18 +63,19 @@ def run_pipeline() -> None:
         return
 
     bot_username = get_bot_username()
-    logger.info("Qualifying %d candidate(s) with Gemini…", len(leads))
+    logger.info("Batch-qualifying %d candidate(s) in a single Gemini call…", len(leads))
+
+    try:
+        qualifications = qualify_leads_batch(leads, bot_username=bot_username)
+    except Exception as exc:
+        logger.error("Batch AI qualification error: %s", exc)
+        return
 
     total_deliveries = 0
     for post in leads:
-        post_id = post.get("post_id", "")
-        try:
-            qualification = qualify_lead(post, bot_username=bot_username)
-        except Exception as exc:
-            logger.error("AI qualification error for %s: %s", post_id, exc)
-            continue
-
-        if qualification is None:
+        post_id = str(post.get("post_id", ""))
+        qualification = qualifications.get(post_id)
+        if not qualification:
             continue
 
         # Cache verified client_lead URLs so admin outreach pitches include live sample proof
@@ -96,9 +97,9 @@ def run_pipeline() -> None:
             logger.error("Notification error for %s: %s", post_id, exc)
 
     logger.info(
-        "Pipeline run complete. Total alert deliveries: %d across %d candidates.",
+        "Pipeline run complete. Total alert deliveries: %d across %d qualified lead(s).",
         total_deliveries,
-        len(leads),
+        len(qualifications),
     )
 
 
@@ -114,10 +115,10 @@ def main() -> None:
     polling_thread.start()
 
     run_pipeline()
-    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_pipeline)
+    schedule.every(CHECK_INTERVAL_SECONDS).seconds.do(run_pipeline)
     logger.info(
-        "Scheduler active. Next run in %d minute(s). Press Ctrl+C to stop.",
-        CHECK_INTERVAL_MINUTES,
+        "Scheduler active. Next run in %d second(s). Press Ctrl+C to stop.",
+        CHECK_INTERVAL_SECONDS,
     )
 
     while True:
