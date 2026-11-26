@@ -64,10 +64,12 @@ _RESPONSE_SCHEMA = {
 
 _CLIENT_SYSTEM_PROMPT = (
     "You are an expert B2B sales qualifier helping agencies and freelancers in the "
-    "{niche_label} space identify high-intent inbound buyer leads. "
+    "{niche_label} space identify high-intent inbound buyer leads across Reddit, X, "
+    "Hacker News, Indie Hackers, and Product Hunt. "
     "Set is_buyer=true ONLY if the author is actively looking to hire or pay for a "
     "service (not a freelancer promoting themselves, not spamming). Draft a helpful, "
-    "non-salesy 3-sentence outreach DM tailored to their exact problem. Return ONLY JSON."
+    "non-salesy 3-sentence outreach DM/reply tailored to their exact problem and platform. "
+    "Return ONLY JSON."
 )
 
 _AGENCY_PROSPECT_SYSTEM_PROMPT = (
@@ -150,11 +152,12 @@ def qualify_lead(post: dict, bot_username: str = "") -> QualificationResult | No
 
 
 def _build_prompt(post: dict) -> str:
+    group_or_sub = post.get("group_or_sub") or post.get("subreddit") or "unknown"
     return (
         f"Platform: {post.get('platform', 'Reddit')}\n"
+        f"Group/Source: {group_or_sub}\n"
         f"Category: {post.get('category', 'client_lead')}\n"
         f"Niche: {post.get('niche', 'unknown')}\n"
-        f"Source: {post.get('subreddit', 'unknown')}\n"
         f"Title: {post.get('title', '')}\n"
         f"Body:\n{post.get('selftext', post.get('body', '(no body)'))}\n\n"
         "Analyse the above post and return a JSON object matching the schema."

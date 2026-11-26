@@ -98,20 +98,55 @@ def send_lead_alert(post: dict, qualification: dict) -> int:
     return sent_count
 
 
+def _format_platform_badge(post: dict) -> str:
+    """Return a clear emoji + platform + group/subreddit badge for Telegram alerts."""
+    platform = (post.get("platform") or "Reddit").strip()
+    group = (post.get("group_or_sub") or post.get("subreddit") or "").strip()
+
+    if platform == "Reddit":
+        if group:
+            sub = group if group.startswith("r/") else f"r/{group}"
+            return f"🟠 Reddit ({_escape_html(sub)})"
+        return "🟠 Reddit"
+
+    if platform in ("X", "X / Twitter"):
+        if group and group.lower() not in ("x", "x / twitter", "x search"):
+            return f"𝕏 X / {_escape_html(group.removeprefix('X '))}"
+        return "𝕏 X / Community"
+
+    if platform in ("Hacker News", "HackerNews"):
+        if group and group.lower() not in ("hacker news", "hackernews"):
+            return f"🟧 Hacker News ({_escape_html(group)})"
+        return "🟧 Hacker News"
+
+    if platform in ("Indie Hackers", "IndieHackers"):
+        if group and group.lower() not in ("indie hackers", "indiehackers"):
+            return f"🔵 Indie Hackers ({_escape_html(group)})"
+        return "🔵 Indie Hackers"
+
+    if platform == "Product Hunt":
+        if group and group.lower() not in ("product hunt", "producthunt"):
+            return f"🚀 Product Hunt ({_escape_html(group)})"
+        return "🚀 Product Hunt"
+
+    return f"🌐 {_escape_html(platform)}" + (f" ({_escape_html(group)})" if group else "")
+
+
 def _format_admin_outreach_message(post: dict, q: dict, today_count: int) -> str:
     """Format the Global 50/Day Outreach Prospect alert for ADMIN_CHAT_ID."""
-    platform = _escape_html(post.get("platform", "Reddit"))
+    badge = _format_platform_badge(post)
     category = _escape_html(post.get("category", "agency_prospect"))
+    score = int(q.get("intent_score", 0))
     summary = _escape_html(q.get("summary", ""))
     custom_dm = _escape_html(q.get("custom_dm", ""))
-    url = post.get("url", "")
+    url = _escape_html(post.get("url", ""))
 
     msg = (
         f"🚀 <b>GLOBAL OUTREACH PROSPECT [{today_count}/{DAILY_OUTREACH_TARGET} Today]</b>\n"
-        f"🌐 <b>Platform:</b> {platform} | 🎯 <b>Type:</b> {category}\n"
+        f"{badge} | 🎯 <b>Type:</b> {category} | ⚡ <b>Score:</b> {score}/10\n"
         f"📝 <b>Context:</b> {summary}\n"
-        f"🔗 <b>Direct Profile/Post Link:</b> {url}\n\n"
-        f"📋 <b>COPY-PASTE PITCH (Includes Live Sample Proof):</b>\n"
+        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>\n\n"
+        f"📋 <b>COPY-PASTE OUTREACH DM / REPLY:</b>\n"
         f"<pre>{custom_dm}</pre>"
     )
 
@@ -126,20 +161,21 @@ def _format_client_lead_message(post: dict, q: dict) -> str:
     score_bar = "🟢" * min(score, 10)
     niche = post.get("niche", "")
     niche_label = NICHE_LABELS.get(niche, niche)
-    platform = _escape_html(post.get("platform", "Reddit"))
+    badge = _format_platform_badge(post)
 
     safe_summary = _escape_html(q.get("summary", ""))
     safe_dm = _escape_html(q.get("custom_dm", ""))
     safe_title = _escape_html(post.get("title", ""))
+    url = _escape_html(post.get("url", ""))
 
     msg = (
         f"🚨 <b>New High-Intent Lead ({niche_label})</b>\n\n"
-        f"🌐 <b>Platform:</b> {platform} | 📌 <b>Source:</b> {_escape_html(post.get('subreddit', ''))}\n"
+        f"{badge}\n"
         f"⚡ <b>Intent Score:</b> {score}/10  {score_bar}\n\n"
         f"📝 <b>Title:</b> {safe_title}\n\n"
         f"💡 <b>Summary:</b> {safe_summary}\n\n"
-        f"🔗 <b>Direct Link:</b> {post.get('url', '')}\n\n"
-        f"✉️ <b>Ready-to-Send DM:</b>\n"
+        f"🔗 <b>Direct Link:</b> <a href=\"{url}\">{url}</a>\n\n"
+        f"✉️ <b>Tailored Outreach DM / Reply:</b>\n"
         f"<pre>{safe_dm}</pre>"
     )
 

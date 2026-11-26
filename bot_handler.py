@@ -127,8 +127,8 @@ def handle_start(message: types.Message) -> None:
     text = (
         f"{status_banner}"
         f"👋 <b>Welcome, {first_name}!</b>\n\n"
-        f"Get <b>real-time, AI-qualified B2B leads</b> straight from Reddit — "
-        f"complete with intent scores and ready-to-send custom DMs.\n\n"
+        f"Get <b>real-time, AI-qualified B2B leads</b> across Reddit, X, Hacker News, "
+        f"Indie Hackers &amp; Product Hunt — complete with intent scores and ready-to-send custom DMs.\n\n"
         f"🎁 Every new user starts with a <b>{TRIAL_DAYS}-Day Free Trial</b>.\n\n"
         f"👇 <b>Choose your target niche below to start receiving leads:</b>"
     )
@@ -266,15 +266,16 @@ def _escape_html(text: str) -> str:
 
 @bot.message_handler(commands=["test_scrape"])
 def handle_test_scrape(message: types.Message) -> None:
-    """Immediately run a live Playwright test scrape and report results to the user."""
+    """Immediately run a 5-platform live test scrape and report per-platform status."""
     chat_id = message.chat.id
     status = get_user_status(chat_id)
     niche = status["niche"] if status["exists"] and status["niche"] in NICHES else "seo_mkt"
 
     bot.send_message(
         chat_id,
-        f"🔎 Running live Playwright test scrape on <code>old.reddit.com</code> for <b>{NICHE_LABELS.get(niche, niche)}</b>…\n"
-        f"Please wait ~10–20 seconds.",
+        f"🔎 Running live 5-platform test scrape (Reddit, Hacker News, Indie Hackers, Product Hunt, X) "
+        f"for <b>{NICHE_LABELS.get(niche, niche)}</b>…\n"
+        f"Please wait ~15–25 seconds.",
     )
 
     def _worker() -> None:
@@ -290,33 +291,43 @@ def handle_test_scrape(message: types.Message) -> None:
 
         status_lines = []
         for d in res["details"]:
-            if d["error"]:
-                status_lines.append(f"• r/{d['subreddit']}: ❌ {_escape_html(d['error'][:100])}")
-            else:
+            badge = d.get("badge") or d.get("platform", "Unknown")
+            if d.get("status") == "Skipped":
                 status_lines.append(
-                    f"• r/{d['subreddit']}: HTTP <b>{d['status']}</b> ({d['posts_scanned']} posts)"
+                    f"• {badge}: ⏭️ Skipped ({_escape_html(d.get('error') or 'not configured')})"
+                )
+            elif d.get("error") and not d.get("posts_scanned"):
+                status_lines.append(
+                    f"• {badge}: ❌ {_escape_html(str(d['error'])[:100])}"
+                )
+            else:
+                http_str = f"HTTP <b>{d['status']}</b>" if d.get("status") else "Done"
+                status_lines.append(
+                    f"• {badge}: {http_str} | {d['posts_scanned']} scanned | {d['matches_found']} matches"
                 )
 
         summary = (
-            f"🧪 <b>Live Scrape Report</b>\n"
+            f"🧪 <b>5-Platform Live Scrape Report</b>\n"
             f"🎯 <b>Niche:</b> {NICHE_LABELS.get(niche, niche)}\n"
-            f"🔍 <b>Keywords:</b> <code>{_escape_html(', '.join(res['keywords'][:5]))}</code>\n\n"
+            f"🔍 <b>Keywords:</b> <code>{_escape_html(', '.join(res['keywords'][:6]))}</code>\n\n"
             + "\n".join(status_lines)
             + f"\n\n📊 <b>Total Scanned:</b> {res['total_scanned']} | <b>Matches:</b> {res['total_matches']}\n"
         )
 
         if res["matches"]:
             summary += "\n🔥 <b>Top Matching Posts:</b>\n"
-            for idx, m in enumerate(res["matches"][:2], start=1):
+            for idx, m in enumerate(res["matches"][:3], start=1):
+                grp = m.get("group_or_sub") or m.get("platform", "")
                 summary += (
-                    f"\n{idx}. <b>r/{_escape_html(m['subreddit'])}</b> (matched <code>{_escape_html(m['matched_keyword'])}</code>)\n"
+                    f"\n{idx}. <b>{_escape_html(m.get('platform', ''))} ({_escape_html(grp)})</b> "
+                    f"(matched <code>{_escape_html(m['matched_keyword'])}</code>)\n"
                     f"📝 {_escape_html(m['title'][:140])}\n"
                     f"🔗 {m['url']}\n"
                 )
         else:
             summary += (
                 "\nℹ️ <b>0 keyword matches found</b> among the latest posts scanned. "
-                "HTTP connectivity and Playwright DOM parsing are working if HTTP 200 &gt; 0 posts appeared above."
+                "Connectivity and DOM parsing are healthy wherever HTTP 200 &gt; 0 scanned appeared above."
             )
 
         bot.send_message(chat_id, summary, disable_web_page_preview=True)

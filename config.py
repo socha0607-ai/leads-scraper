@@ -22,62 +22,117 @@ DODO_PAYMENT_LINK: str = os.getenv(
 BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
 DAILY_OUTREACH_TARGET: int = 50
 
+# Optional X (Twitter) session cookies for authenticated search & joined Communities
+X_AUTH_TOKEN: str = os.getenv("X_AUTH_TOKEN", "").strip()
+X_CT0: str = os.getenv("X_CT0", "").strip()
+
 # ---------------------------------------------------------------------------
 # Niche & Admin Growth Mappings
 # ---------------------------------------------------------------------------
 NICHES: dict[str, dict[str, list[str]]] = {
     "web_dev": {
-        "subreddits": ["SaaS", "startups", "Entrepreneur", "forhire", "freelance_forhire"],
+        "subreddits": [
+            "SaaS",
+            "startups",
+            "Entrepreneur",
+            "forhire",
+            "freelance_forhire",
+            "webdev",
+        ],
         "keywords": [
-            "looking for developer",
-            "looking for a dev",
-            "need a developer",
-            "looking to hire",
-            "build an mvp",
-            "need help building",
-            "need a website",
-            "hire a dev",
-            "recommend a",
-            "anyone know a good",
+            "mvp",
+            "developer",
+            "build an app",
+            "build a website",
+            "web app",
+            "saas",
+            "landing page",
+            "shopify",
+            "wordpress",
+            "react",
+            "next.js",
+            "freelancer",
+            "agency",
+            "prototype",
+            "co-founder",
+            "ui/ux",
         ],
     },
     "ai_auto": {
-        "subreddits": ["Automate", "smallbusiness", "Entrepreneur", "SaaS"],
+        "subreddits": [
+            "Automate",
+            "smallbusiness",
+            "Entrepreneur",
+            "SaaS",
+            "n8n",
+            "zapier",
+        ],
         "keywords": [
-            "ai automation",
-            "automate workflow",
-            "automate my",
-            "looking for agency",
-            "need ai agent",
-            "zapier expert",
-            "looking to hire",
-            "recommend a",
-            "anyone know a good",
+            "automate",
+            "automation",
+            "ai agent",
+            "chatbot",
+            "n8n",
+            "make.com",
+            "zapier",
+            "workflow",
+            "scraper",
+            "scraping",
+            "voice ai",
+            "openai",
+            "api integration",
+            "manual work",
+            "crm",
         ],
     },
     "seo_mkt": {
-        "subreddits": ["smallbusiness", "Entrepreneur", "marketing", "forhire"],
+        "subreddits": [
+            "SEO",
+            "digital_marketing",
+            "marketing",
+            "smallbusiness",
+            "Entrepreneur",
+            "SaaS",
+            "PPC",
+            "freelance",
+        ],
         "keywords": [
-            "need seo",
-            "looking for marketing agency",
-            "google ads help",
-            "need lead generation",
-            "looking to hire",
-            "recommend a",
-            "anyone know a good",
+            "seo",
+            "backlinks",
+            "google ads",
+            "facebook ads",
+            "meta ads",
+            "more clients",
+            "get clients",
+            "lead gen",
+            "lead generation",
+            "marketing",
+            "organic traffic",
+            "google ranking",
+            "search traffic",
+            "agency",
+            "freelancer",
+            "ad spend",
+            "roas",
+            "local seo",
+            "audit",
+            "conversion rate",
         ],
     },
     "admin_growth": {
         "subreddits": ["agency", "freelance", "webdev", "SEO", "marketing"],
         "keywords": [
-	    "need seo",
-	    "looking for marketing agency",
-	    "marketing",
+            "need seo",
+            "looking for marketing agency",
+            "marketing",
             "how to get clients",
             "struggling to find clients",
             "cold email not working",
             "need more leads",
             "first agency client",
+            "more clients",
+            "get clients",
+            "lead generation",
         ],
     },
 }
@@ -126,7 +181,25 @@ WEB_SOCIAL_QUERIES: list[dict[str, str]] = [
     },
 ]
 
+X_SEARCH_QUERIES: list[dict[str, str]] = [
+    {
+        "niche": "seo_mkt",
+        "query": '"need seo" OR "looking for seo" OR "google ads" OR "more clients" -filter:replies',
+    },
+    {
+        "niche": "web_dev",
+        "query": '"need a developer" OR "build an mvp" OR "build a website" OR "looking for react" -filter:replies',
+    },
+    {
+        "niche": "ai_auto",
+        "query": '"automate workflow" OR "ai agent" OR "n8n" OR "zapier" "looking for" -filter:replies',
+    },
+]
+
 HN_API_URL: str = "https://hn.algolia.com/api/v1/search_by_date"
+INDIEHACKERS_NEWEST_URL: str = "https://www.indiehackers.com/newest"
+INDIEHACKERS_GROUPS_URL: str = "https://www.indiehackers.com/groups"
+PRODUCTHUNT_DISCUSSIONS_URL: str = "https://www.producthunt.com/discussions"
 DDG_HTML_URL: str = "https://html.duckduckgo.com/html/"
 
 # ---------------------------------------------------------------------------
@@ -137,9 +210,10 @@ USER_AGENT: str = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+PLAYWRIGHT_TIMEOUT_MS: int = 15_000
 
 # ---------------------------------------------------------------------------
 # SaaS Trial & Qualification Thresholds
 # ---------------------------------------------------------------------------
 TRIAL_DAYS: int = 5
-MIN_INTENT_SCORE: int = 2
+MIN_INTENT_SCORE: int = int(os.getenv("MIN_INTENT_SCORE", "7"))
